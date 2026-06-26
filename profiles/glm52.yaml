@@ -1,0 +1,81 @@
+# GLM-5.2 reference profile for llmconduit.
+#
+# Drop-in: merge this into your config.yaml (or load it as a profile fragment)
+# to get the gateway's GLM-5.2 shaping: thinking-kwarg injection on the
+# Anthropic route, z.ai effort clamping, capability advertisement, and the
+# full-role message mapping. Every field below is optional; trim what you
+# don't need.
+
+# Shared template inherited by GLM-5.2 via `extends`. chat_template_kwargs is
+# profile-level shorthand for upstream_chat_kwargs, forwarded to the upstream
+# verbatim. The static enable_thinking applies on Chat Completions and native
+# Responses; on the Anthropic route the reasoning_effort block below overrides
+# it with an injected value.
+model_profile_templates:
+  thinking:
+    chat_template_kwargs:
+      enable_thinking: true
+
+model_profiles:
+  GLM-5.2:
+    extends:
+      - thinking
+
+    # Profile-level shorthand for upstream_chat_kwargs.chat_template_kwargs,
+    # forwarded to GLM's chat template verbatim.
+    chat_template_kwargs:
+      clear_thinking: false
+
+    upstream_chat_kwargs:
+      # Lets Claude Code fan out independent tool calls in one turn. The Anthropic
+      # (/v1/messages) route has no client field for this, so the profile is the
+      # only way to enable it there.
+      parallel_tool_calls: true
+
+    # Overrides the Anthropic model capabilities advertised on /v1/models. A
+    # configured cap replaces the base wholesale for that key; unconfigured caps
+    # keep the base.
+    capabilities:
+      thinking:
+        types: [adaptive, enabled]
+      effort:
+        levels: [max, xhigh, high, medium, low, minimal, none]
+      structured_outputs: true
+      image_input: false
+      pdf_input: false
+
+    # Full-role mapping: system is accepted at any position (GLM handles inline
+    # system), tool is supported, and developer is rewritten to system. The
+    # wildcard rejects any role not listed. Do NOT set merge_adjacent on tool;
+    # GLM groups tool runs in-template.
+    roles:
+      "*":       { action: reject }
+      user:      {}
+      assistant: {}
+      tool:      {}
+      system:    {}
+      developer: { action: rewrite, target_role: system }
+
+    # Shapes the upstream reasoning_effort field and the thinking kwarg injected
+    # on the Anthropic route. On that route an absent output_config.effort means
+    # thinking is off, but the upstream chat template defaults an absent
+    # enable_thinking to on, so the gateway injects enable_thinking explicitly
+    # to state on/off rather than leave it to the upstream default.
+    reasoning_effort:
+      default: high
+      map:
+        # Mimics z.ai clamp: none/minimal skip thinking, low/medium raise to
+        # high, xhigh raises to max. high and max are native and pass through.
+        none: none
+        minimal: none
+        low: high
+        medium: high
+        high: high
+        xhigh: max
+        max: max
+        # Catch-all for any level outside GLM's set; explicit entries above win.
+        "*": high
+      # These match GLM's defaults and are optional; shown for clarity.
+      thinking_param_name: enable_thinking
+      thinking_param_value_on: true
+      thinking_param_value_off: false

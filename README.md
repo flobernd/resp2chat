@@ -7,6 +7,8 @@ requests, normalizes them, and forwards them to an upstream
 `/v1/chat/completions` server. It can also run server-side tools such as Brave
 Search.
 
+![Architecture: clients (Claude Code via Anthropic Messages, Codex/OpenAI via Responses, OpenAI chat clients) route through the HTTP router and adapters into the gateway engine, which applies per-profile shaping (roles, reasoning_effort, capabilities, parallel_tool_calls) and runs server-side tools, then forwards to OpenAI-compatible upstreams (vLLM, OpenRouter) via the upstream client with routing, failover, and cooldown; config.yaml supplies profiles and upstreams.](architecture.svg)
+
 ## Build
 
 ```bash
@@ -103,13 +105,7 @@ model_profile_templates:
       enable_thinking: true
 
 model_profiles:
-  GLM-5.1:
-    extends:
-      - thinking
-    chat_template_kwargs:
-      clear_thinking: false
-
-  Kimi-K2.6:
+  Kimi-K2.7:
     extends:
       - thinking
     system_prompt_prefix: |
@@ -120,6 +116,8 @@ model_profiles:
   GLM-5.2:
     extends:
       - thinking
+    chat_template_kwargs:
+      clear_thinking: false
     upstream_chat_kwargs:
       parallel_tool_calls: true
 ```
@@ -149,9 +147,9 @@ profiles, not `*`.
 
 Per-model profile matching precedence, highest to lowest:
 
-1. The request model - matched by name (case-insensitive) against `model_profiles`.
-2. The resolved/upstream model (after `upstream_model` rewriting) - matched by name.
-3. The reserved `*` profile - used only when neither 1 nor 2 matches.
+- The request model - matched by name (case-insensitive) against `model_profiles`.
+- The resolved/upstream model (after `upstream_model` rewriting) - matched by name.
+- The reserved `*` profile - used only when neither of the above matches.
 
 Top-level config is the base below all profiles: `upstream_chat_kwargs` is the
 deep-merge base, and `system_prompt_prefix` is always prepended. Client request
@@ -163,17 +161,17 @@ model_profiles:
   "*":
     upstream_chat_kwargs:
       chat_template_kwargs:
-        enable_thinking: true
+        enable_thinking: false
 
   GLM-5.2:
     upstream_chat_kwargs:
       chat_template_kwargs:
-        enable_thinking: false
+        enable_thinking: true
 ```
 
 With this config, a request for `GLM-5.2` uses only the `GLM-5.2` profile
-(`enable_thinking: false`); the `*` profile contributes nothing. A request for
-any other model (e.g. `Qwen-3`) falls back to `*` (`enable_thinking: true`).
+(`enable_thinking: true`); the `*` profile contributes nothing. A request for
+any other model (e.g. `Qwen-3`) falls back to `*` (`enable_thinking: false`).
 
 ### Model capabilities
 
@@ -182,13 +180,15 @@ advertised on `/v1/models` for Anthropic clients.
 
 ```yaml
 model_profiles:
-  "*":
+  GLM-5.2:
     capabilities:
       thinking:
         types: [adaptive, enabled]
       effort:
         levels: [max, xhigh, high, medium, low, minimal, none]
+      structured_outputs: true
       image_input: false
+      pdf_input: false
 ```
 
 - `supported` is the only knob and defaults to `true`. The simple caps (`batch`,
@@ -200,102 +200,73 @@ model_profiles:
   are rejected at load.
 - A configured cap replaces the base (upstream-supplied, else the default
   capabilities) for that cap key, wholesale; unconfigured caps keep the base.
-  A matched profile without a `capabilities` block gets no fill-in from the `*`
-  profile. Caps resolve per upstream id: an id-keyed profile, else the first alias
-  whose `upstream_model` targets the id, else the reserved `*` profile.
 
 ### Reasoning effort
 
 A profile's `reasoning_effort` block shapes the upstream `reasoning_effort` field
-and controls the thinking template kwarg injected on Anthropic routes. Effort
-shaping applies on `/v1/messages`, `/v1/responses`, `/v1/chat/completions`, and
-`/v1/messages/count_tokens`; thinking-kwarg injection applies on the Anthropic
-routes.
+(the value Claude Code sends as `output_config.effort`, and the value OpenAI
+clients send as `reasoning_effort`) and controls the thinking template kwarg the
+gateway injects on the Anthropic route. On that route an absent `output_config.effort`
+means thinking is disabled, and the upstream chat template would otherwise infer
+on/off from the effort field or default it on when the kwarg is absent, so the
+gateway injects an explicit `enable_thinking` template kwarg to state the intent
+rather than leave it implicit. Effort shaping applies on every converting route
+(`/v1/messages`, `/v1/responses`, `/v1/chat/completions`, and
+`/v1/messages/count_tokens`); the thinking-template-kwarg injection applies only
+on the Anthropic routes (`/v1/messages` and `/v1/messages/count_tokens`).
 
 ```yaml
 model_profiles:
-  "*":
+  GLM-5.2:
     reasoning_effort:
       default: high
-      map:
-        low: high
-        xhigh: max
-        "*": high
-      thinking_param_name: enable_thinking
-      thinking_param_value_on: true
-      thinking_param_value_off: false
-```
-
-- `map` translates effort levels case-insensitively. An explicit key wins; `*`
-  rewrites any otherwise-unlisted effort.
-- `default` is emitted when the client does not send an effort. Omitting it sends
-  no `reasoning_effort` field.
-- Anthropic requests always state thinking on/off through the configured template
-  kwarg (default `enable_thinking: true`/`false`), overriding static defaults.
-  A resolved `none` effort forces the off value.
-- A matching profile without `reasoning_effort` is not back-filled from `*`.
-
-The fork's advanced fragment form is also retained. It resolves at the final
-provider leaf, so a routed or failover model receives its own vocabulary, and
-it can place controls anywhere in the request rather than only remapping the
-top-level field:
-
-```yaml
-model_profiles:
-  GLM-5.2:
-    reasoning_effort_default: max
-    reasoning_effort_map:
-      high: {chat_template_kwargs: {reasoning_effort: high}}
-      max: {chat_template_kwargs: {reasoning_effort: max}}
-      none: {chat_template_kwargs: {enable_thinking: false}}
-```
-
-`reasoning_effort` and the fragment-based
-`reasoning_effort_map`/`reasoning_effort_default` form are mutually exclusive
-within a resolved profile.
-
-### Example: GLM-5.2 on vLLM
-
-```yaml
-model_profiles:
-  GLM-5.2:
-    reasoning_effort:
       map:
         none: none
         minimal: none
         low: high
         medium: high
+        high: high
+        "*": high
         xhigh: max
+        max: max
+      thinking_param_name: enable_thinking
+      thinking_param_value_on: true
+      thinking_param_value_off: false
 ```
 
-`parallel_tool_calls` is a typed default: when a client omits it, the resolved
-`upstream_chat_kwargs.parallel_tool_calls` default applies, and an explicit
-client value always wins. The default is the global `upstream_chat_kwargs`
-deep-merged with the matching profile, so a profile value overrides the global
-one. The Anthropic (`/v1/messages`) route has no client field for it, so that
-resolved default is the only way to control it there. Setting it to `true` (as
-on `GLM-5.2` above) lets Claude Code fan out independent tool calls in one turn;
-setting it to `false` forces sequential calls for a model that mishandles
-parallel tool use. llmconduit always forces `false` while a gateway-owned Brave
-Search or image-analysis tool is active, because those internal tool/result
-loops must remain sequential.
-
-### Token counting
-
-`POST /v1/messages/count_tokens` applies the same model resolution, system
-prefix, role rules, tools, chat-template defaults, and backend finalization as
-generation, then calls the upstream server-root `/tokenize` endpoint. An
-upstream without `/tokenize` returns an Anthropic `not_found_error`; that
-unsupported result is cached for the lifetime of the process.
+- `map` translates a client effort level to an upstream effort string. Keys match
+  case-insensitively. A level that is not listed passes through verbatim, unless
+  the reserved `*` entry is set, which rewrites every otherwise-unlisted level. An
+  explicit level always wins over `*`.
+- `default` is the effort emitted when the client sends no effort string. `default:
+  null` (or omitting it) sends no `reasoning_effort` field. `*` does not apply to
+  this case.
+- Anthropic clients expect thinking to be **off** unless the request explicitly
+  enables it, but some upstreams treat an absent `enable_thinking` kwarg as thinking
+  *on*. So on the Anthropic route the gateway always injects a
+  thinking template kwarg into `chat_template_kwargs`, stating on/off explicitly
+  rather than leaving it to the upstream default or inferring it from the effort
+  value. `thinking_param_name` is the kwarg name (default `enable_thinking`);
+  `thinking_param_value_on` / `_off` are the values for thinking-on and thinking-off
+  (defaults `true` / `false`, but any JSON value is allowed). The injected value
+  overrides any static `chat_template_kwargs` default for that key, and a profile
+  with no `reasoning_effort` block still injects the built-in `enable_thinking:
+  true`/`false`.
+- A resolved effort of `none` also forces the off-value on the Anthropic route, even
+  when the request enabled thinking. This is what makes a `map` that clamps low levels
+  to `none` (e.g. z.ai's `minimal`/`none` -> `none`) actually skip thinking.
+- Chat Completions and native Responses clients control the thinking kwarg
+  themselves via `chat_template_kwargs` in the request; the gateway never injects
+  one for them.
+- A profile with no `reasoning_effort` block applies no effort shaping: the client
+  effort is forwarded if present, otherwise omitted (no clamp).
 
 ### Roles
 
 A per-profile `roles` block maps whole-message roles before the conversation is
 sent upstream. It is fail-closed: a role with no matching rule is rejected with
-HTTP 400. With no `roles` block configured, the compatibility behavior remains:
-`developer` is rewritten to `system`, and system messages are hoisted. Adding a
-`roles` block opts that model into the exact policy below, including arbitrary
-role pass-through.
+HTTP 400. With no `roles` block configured, messages pass through **verbatim** - all
+role shaping is opt-in.
 
 `roles` holds an optional `merge_adjacent` list plus a map of role name to a
 rule, or an ordered list of rules. `*` is the wildcard role: it matches any role
@@ -327,8 +298,7 @@ coalesces each maximal run of consecutive messages that share a final role in
 the list into one content-only message joined with `\n\n`. There is no
 inline/leading distinction at this level - it only looks at the role messages
 end up as and whether they are adjacent. Folding system and tool into `user` is
-`rewrite` to `user` plus `merge_adjacent: [user]`, which coalesces the
-resulting adjacent user messages into one while keeping their relative order.
+`rewrite` to `user` plus `merge_adjacent: [user]`, which preserves order.
 
 Resolution order for a message: the explicit role key, then the `*` wildcard,
 then fail-closed `reject`.
@@ -347,9 +317,8 @@ model_profiles:
       developer: { action: rewrite, target_role: system }
 
   # System-FIRST only (Qwen3.5 raises on a non-first system message). An INLINE
-  # system or developer message is rewritten to `user` in place; the index-0
-  # system message stays system and a leading developer message is rewritten to
-  # system, so Qwen never sees a non-first system.
+  # system/developer message is rewritten to `user` in place; the index-0
+  # message stays system, so Qwen never sees a non-first system.
   Qwen3.5:
     roles:
       "*":       { action: reject }
@@ -375,10 +344,24 @@ model_profiles:
       tool:      { action: rewrite, target_role: user, tag: tool_result }
 ```
 
-Optional Brave Search:
+### Brave Search
+
+Setting `brave_api_key` enables a server-side `web_search` tool: when a request
+asks for the built-in `web_search` tool and the model calls it, the gateway runs
+the Brave Search API itself and feeds the results back into the conversation so
+the model can answer (or search again) without its own internet access. With no
+key set, the gateway strips `web_search` from the tool list so the upstream
+never sees it. Related knobs: `brave_max_results` caps results per query
+(default `5`); `max_web_search_rounds` caps how many search rounds a single
+request may run (default `5`; `0` means unlimited, with a hard ceiling of `25`);
+`brave_base_url` is the Brave API endpoint (default
+`https://api.search.brave.com/res/v1`).
 
 ```yaml
 brave_api_key: "..."
+brave_max_results: 5
+max_web_search_rounds: 5
+brave_base_url: "https://api.search.brave.com/res/v1"
 ```
 
 Optional vision offload — forward images to a separate vision-capable model instead
