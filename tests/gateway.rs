@@ -11345,6 +11345,129 @@ async fn e1_unknown_tool_self_corrects_via_repair_round_responses() {
 }
 
 #[tokio::test]
+async fn e1_repair_note_honors_role_mapping_and_keeps_single_leading_system() {
+    // Regression: a DeepSeek-style role policy passes a LEADING system message
+    // through but rewrites INLINE system messages to `developer`. The E1 repair
+    // round injects a closed-tool-set note authored as `system`; it must ride the
+    // SAME mapping (a tail append is inline) and land as `developer`, so the
+    // upstream request the backend sees keeps EXACTLY ONE leading system message.
+    // A trailing raw `system` message is what provoked the original DeepSeek
+    // content leak (regurgitated guidance + a stray tool-markup fragment).
+    let roles: llmconduit::config::RolesConfig = serde_json::from_value(json!({
+        "merge_adjacent": ["developer"],
+        "*": { "action": "reject" },
+        "user": {},
+        "assistant": {},
+        "tool": {},
+        "developer": {},
+        "system": [
+            { "when": "leading" },
+            { "when": "inline", "action": "rewrite", "target_role": "developer" }
+        ]
+    }))
+    .expect("roles config");
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            roles: Some(roles),
+            ..Default::default()
+        },
+    )]);
+
+    let upstream = MockUpstream::default();
+    // Round 1: the model hallucinates an unoffered tool (`Grep`) -> soft-reject.
+    upstream
+        .push_response(vec![Ok(e1_tool_chunk(
+            "chat-0",
+            Some("call_bad"),
+            0,
+            Some("Grep"),
+            Some(r#"{"pattern":"needle"}"#),
+            true,
+        ))])
+        .await;
+    // Round 2 (the repair round): the model self-corrects with text.
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "The answer is 42."))])
+        .await;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    // `instructions` -> leading system; an INLINE system reminder -> developer.
+    let mut request = base_request(vec![
+        ResponseItem::Message {
+            id: None,
+            role: "system".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "inline reminder".to_string(),
+            }],
+            phase: None,
+        },
+        user_message("search the code"),
+    ]);
+    request.instructions = "You are a helpful assistant.".to_string();
+
+    let events = collect_stream(
+        gateway
+            .clone()
+            .stream_responses(request)
+            .await
+            .expect("stream"),
+    )
+    .await;
+    assert!(
+        event_names(&events).contains(&"response.completed"),
+        "the repair turn must complete"
+    );
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2, "one repair round ran");
+
+    // The repair-round request is what the backend actually saw.
+    let msgs: Vec<serde_json::Value> = requests[1]
+        .messages
+        .iter()
+        .map(|m| serde_json::to_value(m).expect("message json"))
+        .collect();
+    let role = |m: &serde_json::Value| m["role"].as_str().unwrap_or_default().to_string();
+    let text = |m: &serde_json::Value| m["content"].as_str().unwrap_or_default().to_string();
+    let roles_seq: Vec<String> = msgs.iter().map(&role).collect();
+
+    // Exactly ONE system message, and it is leading (index 0).
+    let system_positions: Vec<usize> = msgs
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| role(m) == "system")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        system_positions,
+        vec![0],
+        "exactly one leading system message; got roles {roles_seq:?}"
+    );
+
+    // The inline system reminder was rewritten to developer...
+    assert!(
+        msgs.iter()
+            .any(|m| role(m) == "developer" && text(m).contains("inline reminder")),
+        "inline system reminder must be rewritten to developer; roles {roles_seq:?}"
+    );
+    // ...and the closed-tool-set note rode the SAME mapping -> developer, never a
+    // trailing system message.
+    assert!(
+        msgs.iter().any(|m| role(m) == "developer"
+            && text(m).contains("You may only call tools that are explicitly provided")),
+        "closed-tool-set note must be a developer message; roles {roles_seq:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| role(m) == "system" && text(m).contains("You may only call tools")),
+        "the note must NOT appear as a system message; roles {roles_seq:?}"
+    );
+}
+
+#[tokio::test]
 async fn e1_malformed_unknown_tool_args_do_not_error_the_stream() {
     // E1: unknown-tool arguments are NEVER JSON-parsed. Even syntactically broken
     // args must NOT surface a parse error / abort — the call is soft-rejected and

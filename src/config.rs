@@ -506,6 +506,20 @@ impl RolesConfig {
                 }
             }
         }
+        // `merge_adjacent` collapses a run of same-role messages into ONE,
+        // discarding every non-content field (tool_call_id/name/reasoning/
+        // tool_calls). That is lossy for roles that carry those — merging
+        // `assistant` drops its tool_calls, merging `tool` orphans a
+        // tool_call_id — so restrict merging to content-only roles. This also
+        // keeps the merge safe to re-run before every upstream send.
+        const MERGE_SAFE_ROLES: [&str; 3] = ["system", "developer", "user"];
+        for role in &self.merge_adjacent {
+            if !MERGE_SAFE_ROLES.contains(&role.as_str()) {
+                return Err(format!(
+                    "merge_adjacent[{role}]: only content-only roles {MERGE_SAFE_ROLES:?} may be merged (merging `tool`/`assistant` discards tool_call_id/tool_calls)"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -2522,6 +2536,7 @@ mod tests {
     use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
+    use super::RolesConfig;
     use super::UnsupportedImagePolicy;
     use super::apply_env_overrides;
     use super::default_config_path;
@@ -2537,6 +2552,36 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap as StdBTreeMap;
     use std::collections::HashMap;
+
+    #[test]
+    fn merge_adjacent_rejects_non_content_role() {
+        // `merge_adjacent` discards non-content fields, so merging a role that
+        // carries tool_calls/tool_call_id (assistant/tool) would corrupt history.
+        let roles: RolesConfig = serde_json::from_value(json!({
+            "merge_adjacent": ["tool"],
+            "tool": {},
+        }))
+        .expect("parse");
+        let err = roles
+            .validate()
+            .expect_err("tool is not a content-only role");
+        assert!(
+            err.contains("merge_adjacent"),
+            "expected a merge_adjacent guard error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_adjacent_accepts_content_only_roles() {
+        let roles: RolesConfig = serde_json::from_value(json!({
+            "merge_adjacent": ["system", "developer", "user"],
+            "system": {},
+            "developer": {},
+            "user": {},
+        }))
+        .expect("parse");
+        roles.validate().expect("content-only roles may be merged");
+    }
 
     /// Minimal wire request for leaf-finalization tests. `backend_model` is the
     /// FINAL provider model the leaf sees (after any routing/failover/alias

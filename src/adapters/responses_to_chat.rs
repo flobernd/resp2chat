@@ -389,6 +389,20 @@ pub(crate) fn apply_role_rules(
     messages: &mut Vec<ChatMessage>,
     roles: Option<&RolesConfig>,
 ) -> AppResult<()> {
+    // Two decoupled concerns: (1) per-message role rewrite + tag wrap, which is
+    // NOT idempotent (`wrap_role_tag` double-wraps) and so runs exactly once per
+    // message; (2) adjacency merge, which IS idempotent and may re-run before
+    // any upstream send. Keeping them separate lets the engine re-normalize
+    // adjacency after injecting repair-round messages without re-wrapping tags.
+    assign_roles(messages, roles)?;
+    merge_adjacent_if_configured(messages, roles);
+    Ok(())
+}
+
+/// Per-message role rewrite + tag wrap (the non-idempotent half of the role
+/// policy). Runs once per message; `When::Leading`/`Inline` key off the
+/// message's index within `messages` (`0` == leading, `> 0` == inline).
+fn assign_roles(messages: &mut Vec<ChatMessage>, roles: Option<&RolesConfig>) -> AppResult<()> {
     let Some(roles) = roles else {
         return Ok(());
     };
@@ -432,10 +446,74 @@ pub(crate) fn apply_role_rules(
         }
     }
     *messages = out;
+    Ok(())
+}
+
+/// Collapse adjacent same-role runs for the configured roles. IDEMPOTENT (a
+/// collapsed run is a lone message that re-collapses to itself; `\n\n` joins do
+/// not accumulate), so it is safe to re-run before every upstream send. Only
+/// content-only roles may be merged (enforced by `RolesConfig::validate`) since
+/// the merge discards non-content fields (tool_call_id/tool_calls/reasoning).
+pub(crate) fn merge_adjacent_if_configured(
+    messages: &mut Vec<ChatMessage>,
+    roles: Option<&RolesConfig>,
+) {
+    let Some(roles) = roles else {
+        return;
+    };
     if !roles.merge_adjacent.is_empty() {
         merge_adjacent_role_runs(messages, &roles.merge_adjacent);
     }
-    Ok(())
+}
+
+/// Shape ONE message being appended at the TAIL of an already-lowered chat
+/// history. It is always "inline" (never index `0`/leading), so an engine-side
+/// repair injection honors the SAME profile role mapping + tag wrap as the main
+/// lowering pass would have applied to an interleaved message of that role
+/// (e.g. an inline `system` note is rewritten to `developer`). Returns
+/// `Ok(None)` when the profile drops the role. Adjacency cleanup is left to a
+/// subsequent `merge_adjacent_if_configured` pass — this shapes one message.
+pub(crate) fn shape_tail_message(
+    mut message: ChatMessage,
+    roles: Option<&RolesConfig>,
+) -> AppResult<Option<ChatMessage>> {
+    let Some(roles) = roles else {
+        return Ok(Some(message));
+    };
+    let Some(rules) = roles.rules_for(&message.role) else {
+        return Err(AppError::bad_request(format!(
+            "role \"{}\" is not permitted by the model profile roles config",
+            message.role
+        )));
+    };
+    // Tail append ⇒ inline position (index > 0); never matches `Leading`.
+    let Some(rule) = rules
+        .iter()
+        .find(|rule| matches!(rule.when, None | Some(When::Always) | Some(When::Inline)))
+    else {
+        return Err(AppError::bad_request(format!(
+            "role \"{}\" (inline) matches no rule in the model profile roles config",
+            message.role
+        )));
+    };
+    match rule.action {
+        Action::Reject => Err(AppError::bad_request(format!(
+            "role \"{}\" is rejected by the model profile roles config",
+            message.role
+        ))),
+        Action::Drop => Ok(None),
+        Action::Accept => {
+            wrap_role_tag(&mut message, &rule.tag, &rule.tag_attributes);
+            Ok(Some(message))
+        }
+        Action::Rewrite => {
+            if let Some(target) = &rule.target_role {
+                message.role.clone_from(target);
+            }
+            wrap_role_tag(&mut message, &rule.tag, &rule.tag_attributes);
+            Ok(Some(message))
+        }
+    }
 }
 
 fn wrap_role_tag(
@@ -1312,6 +1390,119 @@ mod tests {
             Some(
                 "<instruction priority=\"high &amp; urgent\">new policy</instruction>\n\nquestion"
             )
+        );
+    }
+
+    #[test]
+    fn merge_adjacent_if_configured_is_idempotent() {
+        let roles: RolesConfig = serde_json::from_value(json!({
+            "merge_adjacent": ["developer"],
+            "developer": {},
+            "user": {},
+        }))
+        .expect("roles");
+        let msg = |role: &str, text: &str| ChatMessage {
+            role: role.to_string(),
+            content: Some(json!(text)),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        };
+        let mut messages = vec![
+            msg("developer", "A"),
+            msg("developer", "B"),
+            msg("user", "q"),
+        ];
+        merge_adjacent_if_configured(&mut messages, Some(&roles));
+        assert_eq!(messages.len(), 2, "adjacent developer run collapsed to one");
+        assert_eq!(messages[0].role, "developer");
+        assert_eq!(messages[0].content, Some(json!("A\n\nB")));
+        assert_eq!(messages[1].role, "user");
+        // Re-running before the next upstream send changes nothing (no re-join,
+        // no `\n\n` accumulation) — safe to run on every round.
+        merge_adjacent_if_configured(&mut messages, Some(&roles));
+        assert_eq!(messages.len(), 2, "second pass is a no-op");
+        assert_eq!(
+            messages[0].content,
+            Some(json!("A\n\nB")),
+            "no separator accumulation on re-merge"
+        );
+    }
+
+    #[test]
+    fn shape_tail_message_rewrites_inline_system_to_developer() {
+        let roles: RolesConfig = serde_json::from_value(json!({
+            "system": [
+                { "when": "leading" },
+                { "when": "inline", "action": "rewrite", "target_role": "developer" }
+            ],
+            "developer": {},
+        }))
+        .expect("roles");
+        let note = ChatMessage {
+            role: "system".to_string(),
+            content: Some(json!("closed tool set note")),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        };
+        // A tail append is inline (never leading), so the system note rides the
+        // inline rule and is rewritten to developer — mirrors the repair path.
+        let shaped = shape_tail_message(note, Some(&roles))
+            .expect("shape ok")
+            .expect("not dropped");
+        assert_eq!(shaped.role, "developer");
+        assert_eq!(shaped.content, Some(json!("closed tool set note")));
+    }
+
+    #[test]
+    fn shape_tail_message_rewrites_tool_to_user() {
+        // A no-tool-role template profile rewrites `tool` results to `user`. An
+        // internally-injected tool result (repair / server-tool output) must ride
+        // the same rule so it is not sent as a raw `tool` role the profile forbids.
+        let roles: RolesConfig = serde_json::from_value(json!({
+            "merge_adjacent": ["user"],
+            "tool": { "action": "rewrite", "target_role": "user" },
+            "user": {},
+        }))
+        .expect("roles");
+        let result = ChatMessage {
+            role: "tool".to_string(),
+            content: Some(json!("tool_unavailable: Grep")),
+            tool_call_id: Some("call_bad".to_string()),
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        };
+        let shaped = shape_tail_message(result, Some(&roles))
+            .expect("shape ok")
+            .expect("not dropped");
+        assert_eq!(shaped.role, "user");
+        assert_eq!(shaped.content, Some(json!("tool_unavailable: Grep")));
+    }
+
+    #[test]
+    fn shape_tail_message_passthrough_when_no_roles() {
+        let note = ChatMessage {
+            role: "system".to_string(),
+            content: Some(json!("note")),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        };
+        let shaped = shape_tail_message(note, None)
+            .expect("shape ok")
+            .expect("not dropped");
+        assert_eq!(
+            shaped.role, "system",
+            "no roles config ⇒ legacy passthrough"
         );
     }
 

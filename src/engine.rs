@@ -4,7 +4,9 @@ use crate::adapters::chat_to_responses::StreamEmission;
 use crate::adapters::chat_to_responses::StreamState;
 use crate::adapters::responses_to_chat::LoweredTurn;
 use crate::adapters::responses_to_chat::ToolKind;
-use crate::adapters::responses_to_chat::lower_request_with_image_agent_and_roles;
+use crate::adapters::responses_to_chat::{
+    lower_request_with_image_agent_and_roles, merge_adjacent_if_configured, shape_tail_message,
+};
 use crate::config::Config;
 use crate::config::UnsupportedImagePolicy;
 use crate::error::AppError;
@@ -1540,6 +1542,13 @@ impl Gateway {
         if let Some(api_call_id) = api_call_id.as_deref() {
             self.flow_store().stamp_routing_decision(api_call_id);
         }
+        // Chat-message length of the replayed prefix (the baseline handed to
+        // lowering above). Threaded into `run_turn` so its pre-send adjacency
+        // merge is tail-scoped and never rewrites the cache-stable prefix.
+        let replay_prefix_len = baseline_record
+            .as_ref()
+            .map(|record| record.internal_messages.len())
+            .unwrap_or(0);
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
         tokio::spawn(async move {
@@ -1548,6 +1557,7 @@ impl Gateway {
                     response_id.clone(),
                     request,
                     lowered.messages,
+                    replay_prefix_len,
                     lowered.tools,
                     lowered.tool_registry,
                     lowered.response_format,
@@ -1839,6 +1849,12 @@ impl Gateway {
         response_id: String,
         request: ResponsesRequest,
         mut current_messages: Vec<ChatMessage>,
+        // Length of the replayed prefix carried over from a prior turn. Role
+        // shaping + adjacency merges apply ONLY to the tail
+        // `current_messages[replay_prefix_len..]`, never the replayed prefix, so
+        // the vLLM prefix cache stays byte-identical (mirrors the tail split in
+        // `lower_request_with_image_agent_and_roles`).
+        replay_prefix_len: usize,
         tools: Vec<crate::models::chat::ChatTool>,
         tool_registry: crate::adapters::responses_to_chat::ToolRegistry,
         response_format: Option<Value>,
@@ -2257,6 +2273,13 @@ impl Gateway {
         } else {
             request.parallel_tool_calls
         };
+        // The profile role policy for this resolved model — the SAME config the
+        // initial lowering used (`resolve_roles_config_for_resolved_model`,
+        // pre-spawn). Drives the pre-send adjacency merge + repair-note shaping
+        // below. `None` for a model with no `roles` profile (legacy passthrough).
+        let roles = self
+            .config
+            .resolve_roles_config_for_resolved_model(&request.model, &upstream_model);
         loop {
             // D6: compose the kill token with the client-hangup check — a dashboard
             // `abort()` flips `abort_token`, surfacing `cancelled()` (499) like a hang-up.
@@ -2264,6 +2287,17 @@ impl Gateway {
                 return Err(AppError::cancelled());
             }
             upstream_request_index += 1;
+            // Idempotent, tail-scoped role-adjacency normalization before EVERY
+            // upstream send: fold any repair-injected same-role run (e.g. a
+            // rewritten `developer` note) into its neighbor. Scoped to the tail
+            // (`replay_prefix_len..`) so the replayed prefix stays byte-identical
+            // and the vLLM prefix cache is preserved. A no-op on the first round
+            // (the lowering already merged the tail); merge is idempotent.
+            if roles.is_some() && replay_prefix_len < current_messages.len() {
+                let mut tail = current_messages.split_off(replay_prefix_len);
+                merge_adjacent_if_configured(&mut tail, roles);
+                current_messages.append(&mut tail);
+            }
             let taken_messages = std::mem::take(&mut current_messages);
             // T9: the ONE first-upstream-request builder, shared with the G3
             // estimate. The common base is identical; the additives carry the
@@ -2695,7 +2729,7 @@ impl Gateway {
                 return Err(AppError::cancelled());
             }
             if let Some(message) = finalized.internal_assistant_message.clone() {
-                current_messages.push(message);
+                push_shaped(&mut current_messages, message, roles)?;
             }
             // E1: bounded soft-reject repair for hallucinated (unoffered) tool
             // calls. A TAINTED batch (any rejected call) executes NO server tool
@@ -2778,22 +2812,33 @@ impl Gateway {
                 pending_repair = true;
                 for tool_call in &finalized.tool_calls {
                     if let Some(call_id) = tool_call.internal_call.id.clone() {
-                        current_messages.push(synthetic_tool_result(
-                            call_id,
-                            TAINTED_TOOL_RESULT.to_string(),
-                        ));
+                        push_shaped(
+                            &mut current_messages,
+                            synthetic_tool_result(call_id, TAINTED_TOOL_RESULT.to_string()),
+                            roles,
+                        )?;
                     }
                 }
                 for rejected in &finalized.rejected_tool_calls {
-                    current_messages.push(synthetic_tool_result(
-                        rejected.call_id.clone(),
-                        format!(
-                            "tool_unavailable: the tool \"{}\" is not one of the tools provided in this request.",
-                            rejected.name
+                    push_shaped(
+                        &mut current_messages,
+                        synthetic_tool_result(
+                            rejected.call_id.clone(),
+                            format!(
+                                "tool_unavailable: the tool \"{}\" is not one of the tools provided in this request.",
+                                rejected.name
+                            ),
                         ),
-                    ));
+                        roles,
+                    )?;
                 }
-                current_messages.push(closed_tool_set_note());
+                // Author the closed-tool-set note as a `system` message, then run
+                // it through the SAME profile role mapping an interleaved system
+                // message would get (tail ⇒ inline). For the DeepSeek profile this
+                // rewrites it to `developer`, preserving the "exactly one leading
+                // system message" invariant the backend template expects; the
+                // pre-send merge above folds it into any adjacent developer run.
+                push_shaped(&mut current_messages, closed_tool_set_note(), roles)?;
                 // Relax any forced `tool_choice` so the model can answer in prose
                 // or re-issue a VALID tool call rather than be forced back into a
                 // tool it may not actually have.
@@ -2825,6 +2870,7 @@ impl Gateway {
                 &abort_token,
                 vision_session.as_deref(),
                 &mut current_messages,
+                roles,
                 &mut public_history,
                 &mut response_output,
                 &mut event_state,
@@ -3297,6 +3343,7 @@ impl Gateway {
         abort_token: &tokio_util::sync::CancellationToken,
         vision_session: Option<&str>,
         current_messages: &mut Vec<ChatMessage>,
+        roles: Option<&crate::config::RolesConfig>,
         public_history: &mut Vec<ResponseItem>,
         response_output: &mut Vec<ResponseItem>,
         event_state: &mut ResponseEventState,
@@ -3380,6 +3427,7 @@ impl Gateway {
                         tx,
                         abort_token,
                         current_messages,
+                        roles,
                     )
                     .await?;
                 }
@@ -3390,6 +3438,7 @@ impl Gateway {
                         tx,
                         abort_token,
                         current_messages,
+                        roles,
                         public_history,
                         response_output,
                         event_state,
@@ -3411,6 +3460,7 @@ impl Gateway {
         // so a dashboard kill cancels a stuck/slow Brave search (499) like a hang-up.
         abort_token: &tokio_util::sync::CancellationToken,
         current_messages: &mut Vec<ChatMessage>,
+        roles: Option<&crate::config::RolesConfig>,
         public_history: &mut Vec<ResponseItem>,
         response_output: &mut Vec<ResponseItem>,
         event_state: &mut ResponseEventState,
@@ -3540,15 +3590,19 @@ impl Gateway {
                 detail: format!("web_search result {}", preview_text(&outcome.formatted)),
             });
 
-        current_messages.push(ChatMessage {
-            role: "tool".to_string(),
-            content: Some(Value::String(outcome.formatted.clone())),
-            tool_call_id: tool_call.internal_call.id.clone(),
-            name: None,
-            reasoning_content: None,
-            thinking: None,
-            tool_calls: None,
-        });
+        push_shaped(
+            current_messages,
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some(Value::String(outcome.formatted.clone())),
+                tool_call_id: tool_call.internal_call.id.clone(),
+                name: None,
+                reasoning_content: None,
+                thinking: None,
+                tool_calls: None,
+            },
+            roles,
+        )?;
         Ok(())
     }
 
@@ -3565,6 +3619,7 @@ impl Gateway {
     /// turn still completes (matching the Brave contract); an `AppError::internal`
     /// is reserved for an impossible state (e.g. the dispatcher routed a
     /// non-FunctionCall item here).
+    #[allow(clippy::too_many_arguments)] // distinct mutable tool-loop state threaded per turn
     async fn run_image_analysis(
         &self,
         response_id: &str,
@@ -3575,6 +3630,7 @@ impl Gateway {
         // so a dashboard kill cancels a stuck/slow vision call (499) like a hang-up.
         abort_token: &tokio_util::sync::CancellationToken,
         current_messages: &mut Vec<ChatMessage>,
+        roles: Option<&crate::config::RolesConfig>,
     ) -> AppResult<()> {
         let ResponseItem::FunctionCall { .. } = &tool_call.public_item else {
             return Err(AppError::internal(
@@ -3641,15 +3697,19 @@ impl Gateway {
         // Inject the description as the tool result keyed to the model's
         // `analyzeImage` call id, so the follow-up upstream turn sees it. Nothing
         // is added to public history/output.
-        current_messages.push(ChatMessage {
-            role: "tool".to_string(),
-            content: Some(Value::String(result_text)),
-            tool_call_id: tool_call.internal_call.id.clone(),
-            name: None,
-            reasoning_content: None,
-            thinking: None,
-            tool_calls: None,
-        });
+        push_shaped(
+            current_messages,
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some(Value::String(result_text)),
+                tool_call_id: tool_call.internal_call.id.clone(),
+                name: None,
+                reasoning_content: None,
+                thinking: None,
+                tool_calls: None,
+            },
+            roles,
+        )?;
         Ok(())
     }
 }
@@ -3700,6 +3760,25 @@ fn closed_tool_set_note() -> ChatMessage {
         thinking: None,
         tool_calls: None,
     }
+}
+
+/// Shape an internally-appended tail message through the profile role policy
+/// (always inline — never the conversation-leading message) and push it, so
+/// gateway-injected history (the repair note, synthetic/real tool results, the
+/// internal assistant turn) honors the SAME role mapping the lowering pass
+/// applied to the request tail. `Action::Drop` skips the message. This keeps
+/// injected roles consistent with the request for arbitrary role policies (e.g.
+/// a `tool`->`user` rewrite), not just always-permitted roles; the pre-send
+/// `merge_adjacent_if_configured` pass then folds any adjacent same-role run.
+fn push_shaped(
+    messages: &mut Vec<ChatMessage>,
+    message: ChatMessage,
+    roles: Option<&crate::config::RolesConfig>,
+) -> AppResult<()> {
+    if let Some(shaped) = shape_tail_message(message, roles)? {
+        messages.push(shaped);
+    }
+    Ok(())
 }
 
 fn relax_tool_choice_after_stripping_tool(
