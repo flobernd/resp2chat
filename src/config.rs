@@ -614,8 +614,10 @@ pub struct Config {
     /// and images flow to the upstream unchanged.
     pub image_agent_enabled: bool,
     /// OpenAI-compatible chat-completions endpoint of the vision backend the
-    /// image agent forwards stripped images to. `None` disables the agent even
-    /// when `image_agent_enabled` is true (no endpoint to call), matching
+    /// image agent forwards stripped images to. With `None` the agent only
+    /// activates for profiles whose `modalities` map selects an analyzer
+    /// model (which dispatches through the configured upstreams instead);
+    /// without either backend there is nothing to offload to, matching
     /// claude-relay's "skip without `vision_url`" gate.
     pub vision_url: Option<Url>,
     /// Model id sent to the vision backend.
@@ -1001,6 +1003,15 @@ pub struct PersistedModelProfile {
     /// defers to the name-based default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_vision: Option<bool>,
+    /// Per-modality analyzer map (`image` -> model): the model the G4 image
+    /// agent uses to analyze that modality for requests matching this profile,
+    /// as a per-profile alternative to the global `vision_url`/`vision_model`
+    /// knobs (the profile analyzer wins when both are set). The analyzer call
+    /// dispatches through the gateway's own configured upstreams by model
+    /// name; `image_agent_enabled` remains the master switch. Keys normalize
+    /// to lowercase at startup; only `image` is supported.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modalities: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     /// Per-model map from a canonical reasoning-effort level (`none`/`low`/
@@ -1046,6 +1057,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             native_vision: Option<bool>,
             #[serde(default)]
+            modalities: BTreeMap<String, String>,
+            #[serde(default)]
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default)]
             reasoning_effort_map: BTreeMap<String, JsonValue>,
@@ -1066,6 +1079,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
         // `flatten` swept into the shorthand bucket (they live in typed fields).
         upstream_chat_kwargs.remove("template_family");
         upstream_chat_kwargs.remove("native_vision");
+        upstream_chat_kwargs.remove("modalities");
         upstream_chat_kwargs.remove("reasoning_effort_map");
         upstream_chat_kwargs.remove("reasoning_effort_default");
         upstream_chat_kwargs.remove("reasoning_effort");
@@ -1079,6 +1093,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             roles: raw.roles,
             template_family: raw.template_family,
             native_vision: raw.native_vision,
+            modalities: raw.modalities,
             upstream_chat_kwargs,
             reasoning_effort_map: raw.reasoning_effort_map,
             reasoning_effort_default: raw.reasoning_effort_default,
@@ -1096,6 +1111,9 @@ pub struct ModelProfile {
     pub template_family: Option<String>,
     /// Per-profile native-vision override (G4); see `PersistedModelProfile`.
     pub native_vision: Option<bool>,
+    /// Per-modality analyzer map for the G4 image agent; see
+    /// `PersistedModelProfile`.
+    pub modalities: BTreeMap<String, String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     /// Per-model reasoning-effort map + default; see `PersistedModelProfile`.
     pub reasoning_effort_map: BTreeMap<String, JsonValue>,
@@ -1784,6 +1802,23 @@ impl Config {
             .and_then(|profile| profile.native_vision)
     }
 
+    /// Analyzer model for `modality` (lowercase, e.g. `image`) from the
+    /// matched profiles: the model the G4 image agent dispatches the analysis
+    /// call to, instead of the global `vision_url` client. The request-model
+    /// profile beats the backend-model profile (kwargs precedence); the `*`
+    /// profile applies only when no profile matched.
+    pub fn modality_target(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+        modality: &str,
+    ) -> Option<String> {
+        self.model_profiles_for_resolved_model(request_model, resolved_model)
+            .into_iter()
+            .rev()
+            .find_map(|profile| profile.modalities.get(modality).cloned())
+    }
+
     pub fn resolve_system_prompt_prefix(&self, request_model: &str) -> Option<String> {
         let upstream_model = self.resolve_upstream_model(request_model);
         self.resolve_system_prompt_prefix_for_resolved_model(request_model, &upstream_model)
@@ -1878,6 +1913,7 @@ struct ResolvedModelProfile {
     roles: Option<RolesConfig>,
     template_family: Option<String>,
     native_vision: Option<bool>,
+    modalities: BTreeMap<String, String>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     reasoning_effort_map: BTreeMap<String, JsonValue>,
     reasoning_effort_default: Option<String>,
@@ -1893,6 +1929,7 @@ impl ResolvedModelProfile {
             roles: self.roles,
             template_family: normalize_template_family(self.template_family.as_deref()),
             native_vision: self.native_vision,
+            modalities: self.modalities,
             upstream_chat_kwargs: self.upstream_chat_kwargs,
             reasoning_effort_map: self.reasoning_effort_map,
             reasoning_effort_default: self.reasoning_effort_default,
@@ -2053,6 +2090,17 @@ fn resolve_persisted_model_profile(
     templates: &BTreeMap<String, PersistedModelProfile>,
     stack: &mut Vec<String>,
 ) -> Result<ResolvedModelProfile, String> {
+    // Modality keys are a closed set. Reject typos and blank targets on the
+    // RAW map at startup (the merge below drops blanks, so a later check
+    // could never see them) instead of silently never matching at runtime.
+    for (modality, target) in &profile.modalities {
+        if !modality.trim().eq_ignore_ascii_case("image") {
+            return Err(format!("unknown modality {modality:?} (supported: image)"));
+        }
+        if target.trim().is_empty() {
+            return Err(format!("modality {modality:?} has a blank target model"));
+        }
+    }
     let mut resolved = ResolvedModelProfile::default();
     for template_name in &profile.extends {
         let template_name = template_name.trim();
@@ -2123,6 +2171,10 @@ fn merge_resolved_model_profile(
     if source.reasoning_effort_default.is_some() {
         destination.reasoning_effort_default = source.reasoning_effort_default;
     }
+    // Modalities merge per-key like the effort map (child key wins).
+    for (modality, target) in source.modalities {
+        destination.modalities.insert(modality, target);
+    }
 }
 
 fn merge_persisted_model_profile(
@@ -2171,6 +2223,16 @@ fn merge_persisted_model_profile(
         destination
             .reasoning_effort_default
             .clone_from(&source.reasoning_effort_default);
+    }
+    // Modalities merge per-key (child key wins); keys normalize to lowercase
+    // here so `modality_target` lookups see one casing. A blank target is a
+    // non-override like a blank `upstream_model`.
+    for (modality, target) in &source.modalities {
+        if let Some(target) = trim_nonempty(Some(target.as_str())) {
+            destination
+                .modalities
+                .insert(modality.trim().to_ascii_lowercase(), target);
+        }
     }
 }
 
@@ -4029,6 +4091,155 @@ model_profiles:
                 ("stream_reasoning".to_string(), JsonValue::Bool(true)),
             ])
         );
+    }
+
+    #[test]
+    fn model_profile_modalities_round_trip() {
+        let profile: PersistedModelProfile =
+            serde_yaml::from_str("modalities:\n  image: Qwen3.6-VL\n").expect("profile");
+        assert_eq!(
+            profile.modalities,
+            BTreeMap::from_iter([("image".to_string(), "Qwen3.6-VL".to_string())])
+        );
+        let serialized = serde_yaml::to_string(&profile).expect("serialize");
+        let reparsed: PersistedModelProfile = serde_yaml::from_str(&serialized).expect("reparse");
+        assert_eq!(reparsed, profile);
+    }
+
+    #[test]
+    fn model_profile_modalities_shorthand_does_not_leak_into_chat_kwargs() {
+        // `modalities` is a recognized profile field, so the flatten sweep must
+        // not treat it as a chat-template shorthand kwarg.
+        let profile: PersistedModelProfile =
+            serde_yaml::from_str("modalities:\n  image: Qwen3.6-VL\nthinking: true\n")
+                .expect("profile");
+        assert_eq!(
+            profile.modalities,
+            BTreeMap::from_iter([("image".to_string(), "Qwen3.6-VL".to_string())])
+        );
+        assert!(!profile.upstream_chat_kwargs.contains_key("modalities"));
+        assert_eq!(profile.upstream_chat_kwargs["thinking"], json!(true));
+    }
+
+    #[test]
+    fn model_profile_modalities_merge_per_key_across_extends() {
+        // The template key is deliberately capitalized to prove startup
+        // normalization to lowercase.
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+model_profile_templates:
+  vision-redirect:
+    modalities:
+      Image: Template-VL
+model_profiles:
+  GLM-5.2:
+    extends:
+      - vision-redirect
+    modalities:
+      image: Qwen3.6-VL
+  Kimi-K2.6:
+    extends:
+      - vision-redirect
+"#,
+        )
+        .expect("yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+        // Child wins on a shared key.
+        assert_eq!(
+            config
+                .modality_target("GLM-5.2", "GLM-5.2", "image")
+                .as_deref(),
+            Some("Qwen3.6-VL")
+        );
+        // A key the child does not set survives from the template.
+        assert_eq!(
+            config
+                .modality_target("Kimi-K2.6", "Kimi-K2.6", "image")
+                .as_deref(),
+            Some("Template-VL")
+        );
+    }
+
+    #[test]
+    fn model_profile_unknown_modality_is_a_startup_error() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+model_profiles:
+  GLM-5.2:
+    modalities:
+      audio: Qwen3.6-VL
+"#,
+        )
+        .expect("yaml");
+        let error = Config::from_persisted(&persisted).expect_err("unknown modality must fail");
+        assert!(
+            error.contains("model_profiles[GLM-5.2]")
+                && error.contains("unknown modality \"audio\""),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn model_profile_blank_modality_target_is_a_startup_error() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+model_profiles:
+  GLM-5.2:
+    modalities:
+      image: "  "
+"#,
+        )
+        .expect("yaml");
+        let error = Config::from_persisted(&persisted).expect_err("blank target must fail");
+        assert!(
+            error.contains("model_profiles[GLM-5.2]") && error.contains("blank target"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn modality_target_prefers_request_model_profile_over_wildcard() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+model_profiles:
+  glm-alias:
+    upstream_model: GLM-5.2
+    modalities:
+      image: Request-VL
+  GLM-5.2:
+    modalities:
+      image: Backend-VL
+  "*":
+    modalities:
+      image: Wildcard-VL
+"#,
+        )
+        .expect("yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+        // The request-model profile beats the backend-model profile.
+        assert_eq!(
+            config
+                .modality_target("glm-alias", "GLM-5.2", "image")
+                .as_deref(),
+            Some("Request-VL")
+        );
+        // The backend profile applies when the request model has no profile;
+        // the wildcard must NOT shadow it.
+        assert_eq!(
+            config
+                .modality_target("unprofiled", "GLM-5.2", "image")
+                .as_deref(),
+            Some("Backend-VL")
+        );
+        // The wildcard applies only when no profile matched at all.
+        assert_eq!(
+            config
+                .modality_target("unprofiled", "other-model", "image")
+                .as_deref(),
+            Some("Wildcard-VL")
+        );
+        // An unmapped modality resolves to no target.
+        assert_eq!(config.modality_target("glm-alias", "GLM-5.2", "pdf"), None);
     }
 
     #[test]

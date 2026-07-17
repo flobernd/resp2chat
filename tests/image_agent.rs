@@ -3067,3 +3067,313 @@ async fn e2b_ac9_no_image_bytes_in_failed_error_text_for_degraded_turn() {
         "no image data URI scheme in the failed-turn error text"
     );
 }
+
+// ===========================================================================
+// Profile analyzer selection: a profile `modalities.image` mapping selects the
+// ANALYZER model the image agent dispatches `analyzeImage` calls to, through
+// the gateway's own configured upstreams, as a per-profile alternative to the
+// global `vision_url`/`vision_model` knobs. The agent mechanism (strip,
+// placeholder, tool loop, degrade paths) is unchanged; only which backend
+// answers the analysis call differs.
+// ===========================================================================
+
+/// Config with the image agent enabled and a per-profile analyzer
+/// (`GLM-5.2` maps `image` to `Qwen3.6-VL`) but NO global `vision_url`, so
+/// both activation and the analysis call rely on the profile analyzer alone.
+fn profile_analyzer_config() -> llmconduit::config::Config {
+    let mut config = test_config();
+    config.brave_api_key = None; // isolate the image agent from web_search gating
+    config.image_agent_enabled = true;
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "GLM-5.2".to_string(),
+        llmconduit::config::ModelProfile {
+            modalities: std::collections::BTreeMap::from([(
+                "image".to_string(),
+                "Qwen3.6-VL".to_string(),
+            )]),
+            ..Default::default()
+        },
+    )]);
+    config
+}
+
+#[tokio::test]
+async fn image_agent_profile_analyzer_dispatches_through_upstream() {
+    // Round 1: the text model gets placeholders + analyzeImage and calls it.
+    // Round 2 is the analyzer call itself, dispatched through the gateway's
+    // own upstream under the mapped model and carrying the raw image parts.
+    // Round 3: the collected description returns to the text model as the
+    // tool result and the turn completes.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            "{\"imageId\":[\"1\"],\"task\":\"describe\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-2", "A small red square ")),
+            Ok(content_chunk("chat-2", "on white.")),
+        ])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk(
+            "chat-3",
+            "The image shows a red square.",
+        ))])
+        .await;
+    let vision = MockVisionClient::default();
+    let gateway =
+        test_gateway_with_vision(upstream.clone(), vision.clone(), profile_analyzer_config());
+
+    let mut request = base_request(vec![user_message_with_image(
+        "what is this?",
+        TEST_IMAGE_DATA_URL,
+    )]);
+    request.model = "GLM-5.2".to_string();
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    let requests = upstream.requests().await;
+    let models: Vec<&str> = requests.iter().map(|r| r.model.as_str()).collect();
+    assert_eq!(
+        models,
+        vec!["GLM-5.2", "Qwen3.6-VL", "GLM-5.2"],
+        "the analyzer round runs under the mapped model"
+    );
+
+    // The raw image appears ONLY in the analyzer request; the text model only
+    // ever sees the placeholder.
+    for (index, request) in requests.iter().enumerate() {
+        let serialized = serde_json::to_string(request).expect("serialize");
+        assert_eq!(
+            serialized.contains("iVBORw0KGgo"),
+            index == 1,
+            "raw image bytes must reach exactly the analyzer round (round {index})"
+        );
+    }
+
+    // The analyzer request mirrors the vision-client payload shape.
+    let analyzer = &requests[1];
+    assert_eq!(analyzer.max_output_tokens, Some(4096));
+    assert!(analyzer.tools.is_none(), "no tools on the analyzer call");
+    assert_eq!(
+        analyzer.messages[0]
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str()),
+        Some(llmconduit::vision::VISION_SYSTEM_PROMPT)
+    );
+    let user = analyzer.messages[1].content.as_ref().expect("user content");
+    assert_eq!(user[0]["type"], "image_url");
+    assert_eq!(user[0]["image_url"]["url"], TEST_IMAGE_DATA_URL);
+    assert!(
+        user[1]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Task: describe"),
+        "the analyzer prompt carries the task text"
+    );
+
+    // Round 3 carries the collected streamed description as the tool result.
+    let tool_msg = requests[2]
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .and_then(|m| m.content.as_ref())
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert_eq!(tool_msg, "A small red square on white.");
+
+    // The global vision client was never consulted (none is configured).
+    assert!(vision.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn image_agent_profile_analyzer_beats_global_vision_client() {
+    // Both the global vision_url/vision_model AND the profile map are set: the
+    // per-profile analyzer wins and the global client records zero calls.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            "{\"imageId\":[\"1\"],\"task\":\"describe\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "A red square."))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-3", "done"))])
+        .await;
+    let vision = MockVisionClient::default();
+    let mut config = image_agent_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "GLM-5.2".to_string(),
+        llmconduit::config::ModelProfile {
+            modalities: std::collections::BTreeMap::from([(
+                "image".to_string(),
+                "Qwen3.6-VL".to_string(),
+            )]),
+            ..Default::default()
+        },
+    )]);
+    let gateway = test_gateway_with_vision(upstream.clone(), vision.clone(), config);
+
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = "GLM-5.2".to_string();
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    let requests = upstream.requests().await;
+    assert_eq!(
+        requests.len(),
+        3,
+        "the analyzer round goes through the upstream"
+    );
+    assert_eq!(requests[1].model, "Qwen3.6-VL");
+    assert!(
+        vision.requests().await.is_empty(),
+        "the global vision client must not be called when a profile analyzer exists"
+    );
+}
+
+#[tokio::test]
+async fn image_agent_profile_without_map_falls_back_to_global_client() {
+    // A matched profile WITHOUT a modalities map must not shadow the global
+    // vision_url client: the analysis runs on the global backend.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            "{\"imageId\":[\"1\"],\"task\":\"describe\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "answer"))])
+        .await;
+    let vision = MockVisionClient::default();
+    vision
+        .push_outcome(Ok(llmconduit::vision::VisionOutcome {
+            text: "A red square.".to_string(),
+        }))
+        .await;
+    let mut config = image_agent_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "GLM-5.2".to_string(),
+        llmconduit::config::ModelProfile::default(),
+    )]);
+    let gateway = test_gateway_with_vision(upstream.clone(), vision.clone(), config);
+
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = "GLM-5.2".to_string();
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    assert_eq!(
+        vision.requests().await.len(),
+        1,
+        "the global vision client serves the analysis"
+    );
+    assert_eq!(
+        upstream.requests().await.len(),
+        2,
+        "no analyzer round goes through the upstream"
+    );
+}
+
+#[tokio::test]
+async fn image_agent_master_switch_off_ignores_profile_analyzer() {
+    // `image_agent_enabled: false` disables the agent even when a profile
+    // analyzer is mapped; the image degrades per the E2b residual pass.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let mut config = profile_analyzer_config();
+    config.image_agent_enabled = false;
+    let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
+
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = "GLM-5.2".to_string();
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1, "single round, no tool loop");
+    let has_analyze = requests[0]
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
+    assert!(
+        !has_analyze,
+        "a profile analyzer must not activate the agent when the master switch is off"
+    );
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(
+        !serialized.contains("iVBORw0KGgo"),
+        "the raw image never reaches the text backend"
+    );
+    assert!(
+        serialized.contains("text-only and cannot view images"),
+        "the image degrades to the E2b placeholder"
+    );
+}
+
+#[tokio::test]
+async fn image_agent_profile_analyzer_error_becomes_model_visible_text() {
+    // The analyzer round fails upstream: the failure degrades to model-visible
+    // tool text (mirroring the global-client contract) and the turn completes.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            "{\"imageId\":[\"1\"],\"task\":\"describe\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Err(llmconduit::error::AppError::upstream(
+            "analyzer exploded",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-3", "Sorry, no image."))])
+        .await;
+    let gateway = test_gateway_with_vision(
+        upstream.clone(),
+        MockVisionClient::default(),
+        profile_analyzer_config(),
+    );
+
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = "GLM-5.2".to_string();
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let names = event_names(&events);
+    assert!(names.contains(&"response.completed"));
+    assert!(!names.contains(&"response.failed"));
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 3);
+    let tool_msg = requests[2]
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .and_then(|m| m.content.as_ref())
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        tool_msg.contains("Vision analysis failed"),
+        "the analyzer failure is model-visible tool text: {tool_msg}"
+    );
+    assert!(tool_msg.contains("analyzer exploded"));
+}

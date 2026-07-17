@@ -130,6 +130,17 @@ impl UnknownToolOutcome {
 /// E1: key for the bounded unknown-tool-call counter.
 type UnknownToolCounterKey = (String, String, UnknownToolOutcome);
 
+/// G4: per-turn image-agent state, minted by `activate_image_agent` and
+/// threaded to the `analyzeImage` executor. `id` keys the shared image cache;
+/// `analyzer_model` is the profile-selected analyzer (`modalities.image`) the
+/// analysis call dispatches to through the gateway's own configured upstreams,
+/// `None` meaning the global `vision_url` client.
+#[derive(Debug, Clone)]
+struct ActiveVisionSession {
+    id: String,
+    analyzer_model: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Gateway {
     config: Config,
@@ -1294,10 +1305,13 @@ impl Gateway {
         // see `[Image #N]` placeholder TEXT, never image bytes. When gating
         // activates, `strip_and_cache_images` mutates `request` in place
         // (images → placeholders, inject one `analyzeImage` tool + system
-        // instruction, dedup) and returns a per-turn session id; we then lower
-        // with the image agent active so `analyzeImage` classifies as the
-        // server-side tool and thread the session id to the executor.
-        let vision_session = self.activate_image_agent(&mut request, native_vision).await;
+        // instruction, dedup) and returns the per-turn session (cache id +
+        // analyzer choice); we then lower with the image agent active so
+        // `analyzeImage` classifies as the server-side tool and thread the
+        // session to the executor.
+        let vision_session = self
+            .activate_image_agent(&mut request, native_vision, &resolved_model)
+            .await;
 
         // D3: a pre-spawn early return (replay baseline lookup, lowering/validation,
         // or budgeting below) must finalize the record `Failed` with the correct
@@ -1686,12 +1700,17 @@ impl Gateway {
 
     /// G4 gating + strip. Decide whether the image agent runs for this turn and,
     /// if so, strip images to placeholders, cache them, inject the
-    /// `analyzeImage` tool + system instruction, and return the per-turn cache
-    /// session id. Returns `None` (no mutation) when ANY gate fails.
+    /// `analyzeImage` tool + system instruction, and return the per-turn session
+    /// (cache id + analyzer choice). Returns `None` (no mutation) when ANY gate
+    /// fails.
     ///
     /// All gates (claude-relay + the canonical-Responses adaptation):
-    /// - `image_agent_enabled` is true and a `vision_url` is configured (no
-    ///   endpoint ⇒ nothing to offload to),
+    /// - `image_agent_enabled` is true (the master switch; a profile analyzer
+    ///   never activates the agent when it is off),
+    /// - an analysis backend exists: the matched profile maps `modalities.image`
+    ///   to an analyzer model (dispatched through the gateway's own configured
+    ///   upstreams), or a global `vision_url` is configured. The per-profile
+    ///   analyzer wins over the global client when both are set,
     /// - the LATEST user message carries ≥1 image (old images in history must
     ///   not re-trigger the agent),
     /// - `native_vision` is `false` — the resolved/profiled backend is NOT
@@ -1705,8 +1724,15 @@ impl Gateway {
         &self,
         request: &mut ResponsesRequest,
         native_vision: bool,
-    ) -> Option<String> {
-        if !self.config.image_agent_enabled || self.config.vision_url.is_none() {
+        resolved_model: &str,
+    ) -> Option<ActiveVisionSession> {
+        if !self.config.image_agent_enabled {
+            return None;
+        }
+        let analyzer_model = self
+            .config
+            .modality_target(&request.model, resolved_model, "image");
+        if analyzer_model.is_none() && self.config.vision_url.is_none() {
             return None;
         }
         if request.tool_choice == Value::String("none".to_string()) {
@@ -1725,7 +1751,10 @@ impl Gateway {
         let session_id = format!("vis_{}", Uuid::new_v4().simple());
         self.image_cache
             .strip_and_cache_images(request, &session_id);
-        Some(session_id)
+        Some(ActiveVisionSession {
+            id: session_id,
+            analyzer_model,
+        })
     }
 
     /// Native-vision gating decision (G4). Decides whether to pass raw images
@@ -1867,11 +1896,11 @@ impl Gateway {
         // upstream count can't be used this early.
         estimated_input_tokens: i64,
         upstream_model: String,
-        // G4: `Some(session_id)` when the image agent is active for this turn —
-        // the key into `self.image_cache` the `analyzeImage` executor resolves
-        // images against, and the signal to suppress `analyzeImage` streamed
-        // deltas from the client.
-        vision_session: Option<String>,
+        // G4: `Some` when the image agent is active for this turn: the cache
+        // session + analyzer choice the `analyzeImage` executor runs against,
+        // and the signal to suppress `analyzeImage` streamed deltas from the
+        // client.
+        vision_session: Option<ActiveVisionSession>,
         // D1 (R1 #9): the inbound `api_call_id` for this flow (when the request was
         // captured by the dashboard FlowStore), so `link(response_id, api_call_id)`
         // fires at the RequestStarted seam below.
@@ -2868,7 +2897,7 @@ impl Gateway {
                 &finalized,
                 &tx,
                 &abort_token,
-                vision_session.as_deref(),
+                vision_session.as_ref(),
                 &mut current_messages,
                 roles,
                 &mut public_history,
@@ -3341,7 +3370,7 @@ impl Gateway {
         // the server-tool executors (web search / vision) so a dashboard kill cancels a
         // stuck tool call (499) the same as a hang-up.
         abort_token: &tokio_util::sync::CancellationToken,
-        vision_session: Option<&str>,
+        vision_session: Option<&ActiveVisionSession>,
         current_messages: &mut Vec<ChatMessage>,
         roles: Option<&crate::config::RolesConfig>,
         public_history: &mut Vec<ResponseItem>,
@@ -3607,7 +3636,9 @@ impl Gateway {
     }
 
     /// Run the server-side `analyzeImage` tool (G4). Resolves the requested
-    /// cached images, calls the vision backend bounded by `request_timeout` and
+    /// cached images, calls the analysis backend (the session's per-profile
+    /// analyzer model via the gateway's own upstreams when one is mapped, else
+    /// the global `vision_url` client) bounded by `request_timeout` and
     /// cancellable via `tx.closed()`, and injects the description (or a
     /// model-visible failure/timeout message) back into `current_messages` as
     /// the tool result so the text model can answer.
@@ -3624,7 +3655,7 @@ impl Gateway {
         &self,
         response_id: &str,
         tool_call: &ResolvedToolCall,
-        vision_session: Option<&str>,
+        vision_session: Option<&ActiveVisionSession>,
         tx: &mpsc::Sender<SseEvent>,
         // D6: the flow's kill token, composed with this executor's `tx.closed()` checks
         // so a dashboard kill cancels a stuck/slow vision call (499) like a hang-up.
@@ -3640,21 +3671,22 @@ impl Gateway {
         // The session is always present here: the dispatcher only routes to this
         // executor when `vision_session.is_some()`. Treat its absence as an
         // impossible state rather than silently degrading.
-        let session_id = vision_session.ok_or_else(|| {
+        let session = vision_session.ok_or_else(|| {
             AppError::internal("analyzeImage dispatched without a vision session")
         })?;
         if tx.is_closed() || abort_token.is_cancelled() {
             return Err(AppError::cancelled());
         }
         let vision_request =
-            VisionRequest::from_arguments(&tool_call.arguments, session_id, &self.image_cache);
+            VisionRequest::from_arguments(&tool_call.arguments, &session.id, &self.image_cache);
         self.monitor
             .emit_with(response_id, || MonitorEventKind::ToolPhase {
                 phase: "image_analysis_running".to_string(),
                 detail: format!(
-                    "analyzeImage ids={:?} images={}",
+                    "analyzeImage ids={:?} images={} analyzer={}",
                     vision_request.image_ids,
-                    vision_request.images.len()
+                    vision_request.images.len(),
+                    session.analyzer_model.as_deref().unwrap_or("vision_url"),
                 ),
             });
 
@@ -3667,6 +3699,18 @@ impl Gateway {
                 vision_request.image_ids
             )
         } else {
+            // The per-profile analyzer (dispatched through the gateway's own
+            // upstreams) wins over the global `vision_url` client when both are
+            // configured; activation guaranteed that at least one exists.
+            let analyze = async {
+                match session.analyzer_model.as_deref() {
+                    Some(analyzer) => {
+                        self.analyze_images_via_upstream(analyzer, &vision_request)
+                            .await
+                    }
+                    None => self.vision.analyze(&vision_request).await,
+                }
+            };
             // Bounded + cancellable, mirroring run_web_search: a stalled vision
             // backend must not hang the turn, and a client hang-up cancels it.
             tokio::select! {
@@ -3674,7 +3718,7 @@ impl Gateway {
                 _ = tx.closed() => return Err(AppError::cancelled()),
                 // D6: a kill during the vision call cancels it (499), same as a hang-up.
                 _ = abort_token.cancelled() => return Err(AppError::cancelled()),
-                result = timeout(self.config.request_timeout, self.vision.analyze(&vision_request)) => match result {
+                result = timeout(self.config.request_timeout, analyze) => match result {
                     // Round-3 #3: redact the SUCCESS description before it is
                     // logged (monitor preview below) or injected as a tool
                     // result, so an echoing vision backend cannot leak a
@@ -3711,6 +3755,118 @@ impl Gateway {
             roles,
         )?;
         Ok(())
+    }
+
+    /// G4: run one image analysis against a per-profile analyzer model,
+    /// dispatched through the gateway's own configured upstreams (routing
+    /// `upstreams`, `model_routes`, or the single upstream) by model name, so
+    /// the analyzer needs no separate endpoint config. The payload mirrors
+    /// `ReqwestVisionClient::build_body` (system `VISION_SYSTEM_PROMPT`, one
+    /// user message with the raw image parts then the task/context text).
+    ///
+    /// The `BackendChatRequest` deliberately carries no `response_id`/serving
+    /// token: this is an internal side call, and tagging it with the flow's
+    /// identity would overwrite the dashboard's serving attribution for the
+    /// turn itself. No inner timeout either - the caller's `request_timeout`
+    /// wrapper in `run_image_analysis` bounds the whole call.
+    ///
+    /// Success text AND error detail are redacted with `redact_vision_text`
+    /// (same property as `ReqwestVisionClient`): both become model-visible
+    /// tool text and are logged, so an analyzer that echoes a submitted
+    /// `data:`/signed image URL must not re-leak it.
+    async fn analyze_images_via_upstream(
+        &self,
+        analyzer_model: &str,
+        request: &VisionRequest,
+    ) -> AppResult<crate::vision::VisionOutcome> {
+        let mut user_content: Vec<Value> = request
+            .images
+            .iter()
+            .map(|image| {
+                let mut image_url = serde_json::Map::new();
+                image_url.insert("url".to_string(), Value::String(image.image_url.clone()));
+                if let Some(detail) = &image.detail {
+                    image_url.insert("detail".to_string(), Value::String(detail.clone()));
+                }
+                serde_json::json!({ "type": "image_url", "image_url": Value::Object(image_url) })
+            })
+            .collect();
+        let mut prompt = format!("Task: {}", request.task);
+        if let Some(context) = &request.context {
+            prompt.push_str(&format!("\nContext: {context}"));
+        }
+        user_content.push(serde_json::json!({ "type": "text", "text": prompt }));
+        let chat_request = ChatCompletionRequest {
+            model: analyzer_model.to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(Value::String(
+                        crate::vision::VISION_SYSTEM_PROMPT.to_string(),
+                    )),
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                    thinking: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(Value::Array(user_content)),
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                    thinking: None,
+                    tool_calls: None,
+                },
+            ],
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: Some(4096),
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: BTreeMap::new(),
+        };
+        let backend_request =
+            crate::upstream::BackendChatRequest::new(chat_request, None, None, None);
+        let redact_err = |err: AppError| {
+            AppError::upstream(format!(
+                "vision analyzer request failed: {}",
+                crate::redaction::redact_vision_text(&err.to_string())
+            ))
+        };
+        let mut stream = self
+            .upstream
+            .stream_chat_completion(&backend_request)
+            .await
+            .map_err(redact_err)?;
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(redact_err)?;
+            if let Some(content) = chunk
+                .choices
+                .first()
+                .and_then(|choice| choice.delta.content.as_deref())
+            {
+                text.push_str(content);
+            }
+        }
+        if text.trim().is_empty() {
+            return Err(AppError::upstream(
+                "vision response missing message content",
+            ));
+        }
+        Ok(crate::vision::VisionOutcome {
+            text: crate::redaction::redact_vision_text(&text),
+        })
     }
 }
 

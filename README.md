@@ -385,6 +385,46 @@ forwarded raw:
 unsupported_image_policy: placeholder
 ```
 
+### Modalities
+
+A profile's `modalities` map selects, per input modality, the analyzer model
+the image agent uses for requests that resolve to that profile - a per-profile
+alternative to the global `vision_url`/`vision_model` knobs above. With an
+`image` entry, an image-carrying request stays on the profile's model: images
+in the latest user turn are replaced with placeholders, the text model is
+handed an `analyzeImage` tool, the gateway calls the mapped analyzer, and the
+resulting description is injected back as the tool result. The text model
+keeps driving the conversation throughout. `image` is the only supported
+modality key today; the map is open for future modalities (unknown keys and
+blank targets are startup errors).
+
+```yaml
+model_profiles:
+  GLM-5.2:
+    modalities:
+      image: Qwen3.6-VL
+```
+
+With this config, a request for `GLM-5.2` is always served by GLM-5.2; when it
+carries an image, Qwen3.6-VL analyzes the image on GLM-5.2's behalf.
+
+- The analyzer is dispatched through the gateway's own configured upstreams by
+  model name: in routing mode the provider whose catalog lists it, a
+  `model_routes` entry mapping the name to an endpoint URL, or the single
+  configured upstream. No separate vision URL is needed.
+- `image_agent_enabled` is the master switch: when false the agent never
+  activates, map or not. With the flag on, a profile's map beats the global
+  `vision_url`/`vision_model`; profiles without a map fall back to those
+  global knobs.
+- The map follows the per-model profile matching precedence above: an entry on
+  the request model's profile beats one on the resolved upstream model's
+  profile, and the `*` profile's map applies only when no specific profile
+  matched.
+- Backends with native vision support (profile `native_vision: true` or
+  built-in name detection) bypass the agent entirely and receive raw images.
+  Any image that reaches a non-native-vision backend outside the agent path
+  gets the `unsupported_image_policy` handling described above.
+
 ## Run
 
 ```bash

@@ -121,6 +121,8 @@ Global → matched model profile templates (`extends:` in order) → matched mod
 
 Profiles are considered against the resolved catalog model, the configured upstream-model remap target, and the original request model, de-duplicated in that order. For kwargs, later matches override earlier matches, so request-model profile settings beat backend-model profile settings on conflict. For `system_prompt_prefix`, global prefix is prepended and the most specific matched profile prefix is appended before request `instructions`.
 
+A per-profile `modalities` map selects the analyzer model the image agent uses for requests that resolve to that profile, a per-profile alternative to the global `vision_url`/`vision_model` knobs; the analyzer is dispatched through the gateway's own configured upstreams by model name (routing catalog, `model_routes` entry, or the single upstream). The request-model profile's map beats the backend-model profile's (`*` only when nothing matched).
+
 `upstreams: [...]` switches the app to model-routing mode. `/v1/models` exposes the ordered union of primary upstream model catalogs plus fallback `exposed_model` aliases. Exact model id wins; normalized alias routing uses `canonical_model_key` and only succeeds when it maps to one unique id. Blank/missing/unavailable/ambiguous models default to the first model in the first non-empty provider catalog.
 
 ## Testing

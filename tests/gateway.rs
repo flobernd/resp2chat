@@ -7582,6 +7582,333 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
     assert_eq!(first_chat_requests, 0);
 }
 
+// ===========================================================================
+// Profile modality map: `modalities.image` selects the ANALYZER model the G4
+// image agent dispatches `analyzeImage` calls to, through the gateway's own
+// configured upstreams, as a per-profile alternative to the global
+// `vision_url`/`vision_model` knobs. The focused in-process suite lives in
+// `tests/image_agent.rs`; the wiremock tests below prove the analyzer call
+// lands on the right provider (routing mode) / routed URL (`model_routes`).
+// ===========================================================================
+
+/// SSE body for a single-chunk `analyzeImage` tool call, the first round the
+/// text provider answers in the analyzer tests below.
+fn analyze_image_tool_call_sse_body() -> String {
+    chat_completion_sse_body(&[json!({
+        "id": "chat-tool-call",
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "id": "call_img_1",
+                "index": 0,
+                "type": "function",
+                "function": {
+                    "name": "analyzeImage",
+                    "arguments": "{\"imageId\":[\"1\"],\"task\":\"describe\"}"
+                }
+            }]},
+            "finish_reason": "tool_calls"
+        }],
+        "usage": null
+    })])
+}
+
+/// SSE body for a single content chunk, used for the analyzer's description
+/// and the text provider's final answer.
+fn single_content_sse_body(id: &str, content: &str) -> String {
+    chat_completion_sse_body(&[json!({
+        "id": id,
+        "choices": [{
+            "index": 0,
+            "delta": {"content": content},
+            "finish_reason": null
+        }],
+        "usage": null
+    })])
+}
+
+/// The image-carrying chat body the analyzer tests POST to the gateway.
+fn image_chat_body(model: &str) -> serde_json::Value {
+    json!({
+        "model": model,
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAA"}
+                }
+            ]
+        }]
+    })
+}
+
+/// POST `/v1/chat/completions` chat POSTs recorded by a wiremock server.
+async fn recorded_chat_posts(server: &MockServer) -> Vec<wiremock::Request> {
+    server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn modality_map_routing_sends_analyzer_call_to_target_provider() {
+    let glm = MockServer::start().await;
+    let qwen = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.2"}]
+        })))
+        .mount(&glm)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "qwen3.6-vl"}]
+        })))
+        .mount(&qwen)
+        .await;
+    // Round 1: the text model calls analyzeImage. Mounted FIRST with
+    // `up_to_n_times(1)` so the follow-up round falls through to the final
+    // answer mock below.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(analyze_image_tool_call_sse_body()),
+        )
+        .up_to_n_times(1)
+        .mount(&glm)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(single_content_sse_body("chat-glm-2", "a red square")),
+        )
+        .mount(&glm)
+        .await;
+    // The analyzer provider answers the analysis call with the description.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"model": "qwen3.6-vl"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(single_content_sse_body(
+                    "chat-qwen-1",
+                    "A red square on white.",
+                )),
+        )
+        .mount(&qwen)
+        .await;
+
+    let mut config = test_config();
+    config.image_agent_enabled = true;
+    config.upstreams = vec![
+        UpstreamConfig {
+            name: "glm".to_string(),
+            upstream_base_url: format!("{}/v1/", glm.uri()).parse().expect("url"),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            upstream_request_log_path: None,
+            fallback_upstreams: Vec::new(),
+        },
+        UpstreamConfig {
+            name: "qwen".to_string(),
+            upstream_base_url: format!("{}/v1/", qwen.uri()).parse().expect("url"),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            upstream_request_log_path: None,
+            fallback_upstreams: Vec::new(),
+        },
+    ];
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.2".to_string(),
+        llmconduit::config::ModelProfile {
+            modalities: std::collections::BTreeMap::from([(
+                "image".to_string(),
+                "qwen3.6-vl".to_string(),
+            )]),
+            ..Default::default()
+        },
+    )]);
+    let app = llmconduit::build_app(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(image_chat_body("glm-5.2").to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(
+        body["choices"][0]["message"]["content"].as_str(),
+        Some("a red square"),
+        "the turn itself is served by the glm provider"
+    );
+
+    // The glm provider served both text rounds, never the raw image.
+    let glm_posts = recorded_chat_posts(&glm).await;
+    assert_eq!(glm_posts.len(), 2, "tool-call round + answer round");
+    for post in &glm_posts {
+        let body: serde_json::Value = post.body_json().expect("chat json");
+        assert_eq!(body["model"].as_str(), Some("glm-5.2"));
+        assert!(
+            !body.to_string().contains("iVBORw0KGgo"),
+            "no raw image may reach the text provider"
+        );
+    }
+
+    // The analyzer POST landed on the qwen provider with the raw image.
+    let qwen_posts = recorded_chat_posts(&qwen).await;
+    assert_eq!(qwen_posts.len(), 1, "exactly one analyzer call");
+    let analyzer_body: serde_json::Value = qwen_posts[0].body_json().expect("chat json");
+    assert_eq!(analyzer_body["model"].as_str(), Some("qwen3.6-vl"));
+    assert!(
+        analyzer_body.to_string().contains("iVBORw0KGgo"),
+        "the analyzer receives the raw image"
+    );
+    assert!(
+        analyzer_body.to_string().contains("Task: describe"),
+        "the analyzer receives the task text"
+    );
+}
+
+#[tokio::test]
+async fn modality_map_model_route_sends_analyzer_call_to_routed_url() {
+    let main = MockServer::start().await;
+    let analyzer = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.2"}]
+        })))
+        .mount(&main)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(analyze_image_tool_call_sse_body()),
+        )
+        .up_to_n_times(1)
+        .mount(&main)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(single_content_sse_body("chat-main-2", "a red square")),
+        )
+        .mount(&main)
+        .await;
+    // The routed analyzer endpoint needs no `/v1/models`: route providers are
+    // matched by name, not catalog.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"model": "qwen3.6-vl"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(single_content_sse_body(
+                    "chat-route-1",
+                    "A red square on white.",
+                )),
+        )
+        .mount(&analyzer)
+        .await;
+
+    let mut config = test_config();
+    config.image_agent_enabled = true;
+    config.upstreams = vec![UpstreamConfig {
+        name: "main".to_string(),
+        upstream_base_url: format!("{}/v1/", main.uri()).parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        upstream_request_log_path: None,
+        fallback_upstreams: Vec::new(),
+    }];
+    config.model_routes = vec![llmconduit::config::ModelRoute {
+        name: "qwen3.6-vl".to_string(),
+        glob: None,
+        upstream_base_url: format!("{}/v1/", analyzer.uri()).parse().expect("url"),
+        upstream_model: None,
+    }];
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.2".to_string(),
+        llmconduit::config::ModelProfile {
+            modalities: std::collections::BTreeMap::from([(
+                "image".to_string(),
+                "qwen3.6-vl".to_string(),
+            )]),
+            ..Default::default()
+        },
+    )]);
+    let app = llmconduit::build_app(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(image_chat_body("glm-5.2").to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(
+        body["choices"][0]["message"]["content"].as_str(),
+        Some("a red square"),
+        "the turn itself is served by the main upstream"
+    );
+
+    let main_posts = recorded_chat_posts(&main).await;
+    assert_eq!(main_posts.len(), 2, "tool-call round + answer round");
+
+    // The analyzer POST hit the model_routes URL for the mapped model.
+    let analyzer_posts = recorded_chat_posts(&analyzer).await;
+    assert_eq!(analyzer_posts.len(), 1, "exactly one analyzer call");
+    let analyzer_body: serde_json::Value = analyzer_posts[0].body_json().expect("chat json");
+    assert_eq!(analyzer_body["model"].as_str(), Some("qwen3.6-vl"));
+    assert!(
+        analyzer_body.to_string().contains("iVBORw0KGgo"),
+        "the analyzer receives the raw image"
+    );
+}
+
 #[tokio::test]
 async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstream_model() {
     let first = MockServer::start().await;

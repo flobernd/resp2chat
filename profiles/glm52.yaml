@@ -44,6 +44,15 @@ model_profiles:
       image_input: false
       pdf_input: false
 
+    # Optional image-agent analyzer: an image-carrying request that resolves to
+    # GLM-5.2 keeps GLM-5.2 as the text model, and the mapped model analyzes the
+    # images on its behalf. Requires `image_agent_enabled: true`; the analyzer
+    # must be a multimodal model reachable through the configured upstreams or a
+    # `model_routes` entry. When mapping `image:`, usually also advertise
+    # `capabilities.image_input: true` above so clients send images.
+    # modalities:
+    #   image: Qwen3.6-VL
+
     # Full-role mapping: system is accepted at any position (GLM handles inline
     # system), tool is supported, and developer is rewritten to system. The
     # wildcard rejects any role not listed. Do NOT set merge_adjacent on tool;
