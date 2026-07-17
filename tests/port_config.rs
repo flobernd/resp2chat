@@ -13,8 +13,8 @@
 //!   regression guard, since this touches the same config-resolution code.
 //!
 //! These are the PURE config-resolution tests. The gateway-driving HTTP routing
-//! tests — which mount wiremock upstreams and assert which one received the
-//! request — live in the sibling `tests/port_config_routing.rs`.
+//! tests - which mount wiremock upstreams and assert which one received the
+//! request - live in the sibling `tests/port_config_routing.rs`.
 
 mod common;
 
@@ -59,6 +59,19 @@ fn removed_global_knobs_fail_startup_with_migration_hint() {
             "{key}: {err}"
         );
     }
+}
+
+/// A config that declares `upstreams:` but no `model_profiles:` at all cannot
+/// route anything, so it fails startup naming the catch-all fix instead of
+/// leaving every request a silent 404.
+#[test]
+fn empty_model_profiles_fail_startup_with_migration_hint() {
+    let yaml = "upstreams: [{ name: l, url: \"http://h/v1\" }]\n";
+    let err = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap_err();
+    assert!(
+        err.contains("model_profiles") && err.contains("Migrating"),
+        "{err}"
+    );
 }
 
 /// A missing config file resolves to the minimal profile config: one `default`
@@ -221,7 +234,7 @@ fn leaf_family_chat_template_kwargs(config: &Config, backend_model: &str) -> ser
 // ---------------------------------------------------------------------------
 
 /// Writing a config to a `.toml` path is rejected cleanly (not a panic) and
-/// never produces a file — `configure` writes YAML, `.toml` is read-only.
+/// never produces a file - `configure` writes YAML, `.toml` is read-only.
 #[test]
 fn writing_config_to_toml_path_errors_and_creates_no_file() {
     let path = std::env::temp_dir().join(format!(
@@ -260,6 +273,8 @@ upstreams:
   - name: aliased
     upstream_base_url: "http://127.0.0.1:8001/v1"
     upstream_api_key: "k"
+model_profiles:
+  "*": { upstream: local }
 "#;
     let persisted: PersistedConfig = serde_yaml::from_str(yaml).expect("yaml");
     let config = Config::from_persisted(&persisted).expect("config");

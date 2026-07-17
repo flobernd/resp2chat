@@ -7081,7 +7081,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
         // provider model ("fallback-model"), not the request alias ("client-model").
         // The failover target has no profile of its own, so the request-alias
         // profile's `chat_template_kwargs` ({model_default, shared:"model"}) do
-        // NOT bleed onto the fallback — only the fallback PROVIDER's own kwargs
+        // NOT bleed onto the fallback - only the fallback PROVIDER's own kwargs
         // ({fallback_default, shared:"fallback"}) reach the backend.
         assert_eq!(
             body["chat_template_kwargs"],
@@ -10257,7 +10257,7 @@ async fn f1e_ac14_oversized_frame_partial_and_no_hang() {
 /// NEITHER the secret VALUE nor any image `data:`/URL bytes. Runs through the REAL
 /// `ReqwestUpstreamClient` leaf (wiremock) so `upstream_request` is actually captured
 /// (the in-process `MockUpstream` bypasses the dispatch tap, leaving that section
-/// absent — see AC-7/8). The profile declares no `image_analysis`, so the images pass
+/// absent - see AC-7/8). The profile declares no `image_analysis`, so the images pass
 /// through to the upstream; two redaction paths still converge on the CAPTURE: the
 /// middleware redacts the raw inbound body (secret keys + image URIs) BEFORE
 /// `inbound_request` capture, and the on-wire OpenAI request is redacted by
@@ -10269,7 +10269,7 @@ async fn f1e_ac14_oversized_frame_partial_and_no_hang() {
 ///
 /// NON-VACUOUS upstream side (F1f review r1): the inbound `api_key` is dropped by
 /// `/v1/messages` pre-lowering and the on-wire image URIs are redacted at capture, so no
-/// inbound secret naturally survives into `upstream_request` — an upstream-only assertion
+/// inbound secret naturally survives into `upstream_request` - an upstream-only assertion
 /// on those would pass even with the upstream redaction deleted. To genuinely exercise the
 /// upstream secret pass, a sensitive-KEYED `upstream_chat_kwargs` value is seeded; it
 /// flattens into the on-wire `extra_body` and truly reaches `upstream_request`, where
@@ -10305,7 +10305,7 @@ async fn f1f_ac16_request_sections_redact_secret_and_image_end_to_end() {
     // Non-vacuous `upstream_request` redaction (F1f review r1): the inbound top-level
     // `api_key` below is DROPPED by `/v1/messages` before lowering (and the on-wire image
     // URIs are redacted at capture), so nothing secret-bearing from the inbound body
-    // actually survives into `upstream_request` — deleting the upstream-side redaction
+    // actually survives into `upstream_request` - deleting the upstream-side redaction
     // would still pass on the api_key alone. To
     // genuinely EXERCISE the `redacted_upstream_request_bytes` secret pass, seed a
     // sensitive-KEYED `upstream_chat_kwargs` value: it gap-fills into the on-wire

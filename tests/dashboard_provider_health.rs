@@ -7,7 +7,7 @@
 //! `mark_failure`/`mark_provider_success` paths directly. This file closes the
 //! gap those cannot reach from outside the crate: the IDLE cooling→Healthy flip
 //! published by the `Gateway`'s real publication task (1 s tick + cooldown-
-//! deadline wake) with ZERO traffic after the provider entered cooldown — a
+//! deadline wake) with ZERO traffic after the provider entered cooldown - a
 //! provider is driven into cooldown by a real failing upstream POST, then
 //! recovers purely on the deadline wake.
 

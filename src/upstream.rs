@@ -236,8 +236,9 @@ pub struct ProviderHealth {
     pub failover_count: u64,
     /// Consecutive failures since the last success (reset to 0 on success).
     pub consecutive_failures: u32,
-    /// Epoch-ms instant this provider's `/v1/models` catalog was last fetched
-    /// (`None` until the first refresh; only the routing client populates it).
+    /// Epoch-ms instant the routing client's union catalog was last fetched
+    /// (`None` until the first refresh; the same client-wide value is stamped
+    /// onto every provider, not a per-provider timestamp).
     pub catalog_fetched_ms: Option<u64>,
     /// Number of models in the routing client's union catalog across all
     /// upstreams (`None` until the first refresh; the same client-wide value is
@@ -383,7 +384,7 @@ pub struct UpstreamModelEntry {
 const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
 /// One pre-first-chunk serving backend: its FINAL model id (after the profile
-/// chain's per-step model rewrite — no further remap) and the context-window
+/// chain's per-step model rewrite - no further remap) and the context-window
 /// length the upstream reports for it, for G3 pre-flight budgeting (T9).
 /// `context_limit: None` ⇒ the upstream did not report a window for this model
 /// (budgeting no-ops for it).
@@ -396,8 +397,8 @@ pub struct BackendCandidate {
 /// Typed backend-candidate plan: the routing/failover layer's answer to "which
 /// backend models could serve this request pre-first-chunk, and what context
 /// window does each report?" G3 pre-flight budgeting consumes the candidate
-/// CONTEXT LIMITS (conservative MIN — the strictest window across the failover
-/// chain — so a failover to a smaller model cannot overflow; unknown ⇒ no-op)
+/// CONTEXT LIMITS (conservative MIN - the strictest window across the failover
+/// chain - so a failover to a smaller model cannot overflow; unknown ⇒ no-op)
 /// instead of budgeting against the pre-routing `resolved_model` (T9).
 ///
 /// Empty `candidates` ⇒ unknown candidate set (catalog-load failure): budgeting
@@ -451,8 +452,8 @@ pub trait UpstreamClient: Send + Sync {
 
     /// Every backend model `requested_model` could ACTUALLY be served
     /// pre-first-chunk, after the profile chain's per-step model rewrite. This
-    /// enumerates the full candidate set — the primary AND every declared
-    /// fallback — because failover happens before the first chunk, so the model
+    /// enumerates the full candidate set - the primary AND every declared
+    /// fallback - because failover happens before the first chunk, so the model
     /// that ultimately serves may be any of them.
     ///
     /// Default impl: thin projection over
@@ -2024,7 +2025,7 @@ impl UpstreamClient for FailoverUpstreamClient {
     /// unchanged. We enumerate ALL providers (not just currently-available
     /// ones) because cooldown is transient, so any of them may serve
     /// pre-first-chunk. Context limits are `None` (a failover chain does not
-    /// load per-provider `/v1/models` catalogs, so G3 budgeting no-ops —
+    /// load per-provider `/v1/models` catalogs, so G3 budgeting no-ops -
     /// matching pre-T9 behavior).
     async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         let candidates = self

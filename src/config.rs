@@ -1231,9 +1231,9 @@ fn default_bind_addr() -> String {
     "127.0.0.1:4000".to_string()
 }
 
-/// Base URL of the `default` upstream in the out-of-box minimal config, and the
-/// inert value `from_persisted` parks in the vestigial runtime
-/// `Config.upstream_base_url` (Tasks 6-7 remove that field).
+/// Base URL seeded into the `default` upstream entry of the out-of-box
+/// minimal config (`PersistedConfig::default()`), and the value the setup
+/// wizard pre-fills for the upstream URL prompt when no config exists yet.
 const DEFAULT_UPSTREAM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 
 fn default_brave_base_url() -> String {
@@ -1440,6 +1440,12 @@ impl Config {
         let upstreams = parse_upstreams(&config.upstreams)?;
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
+        if model_profiles.is_empty() {
+            return Err(
+                "`model_profiles` is empty; every served model needs a profile - add one (a catch-all works: `model_profiles: {\"*\": {upstream: <name>}}`) (see README \"Migrating\")"
+                    .to_string(),
+            );
+        }
         validate_model_profiles(&model_profiles, &upstreams)?;
         Ok(Self {
             bind_addr,
@@ -1611,7 +1617,7 @@ impl Config {
     /// budgeting may fall back to it when the candidate plan has no known window.
     /// In any other mode the candidate plan is the authoritative resolver
     /// (profile routing rewrites the model pre-first-chunk), so the engine union
-    /// catalog must NOT be used as a budgeting fallback — it could mask a
+    /// catalog must NOT be used as a budgeting fallback - it could mask a
     /// failover target's smaller window or budget a routed model against the
     /// wrong window (T9).
     pub fn is_plain_single_provider(&self) -> bool {
@@ -2912,8 +2918,13 @@ model_profiles:
             "llmconduit-turn-capture-{}.yaml",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::write(&yaml_path, "turn_capture_dir: /tmp/llmconduit-turns\n")
-            .expect("write yaml");
+        std::fs::write(
+            &yaml_path,
+            "turn_capture_dir: /tmp/llmconduit-turns\n\
+             upstreams:\n  - name: u\n    url: \"http://h/v1\"\n\
+             model_profiles:\n  \"*\": { upstream: u }\n",
+        )
+        .expect("write yaml");
         let yaml_config = Config::from_env_and_file(Some(&yaml_path)).expect("load yaml config");
         let _ = std::fs::remove_file(&yaml_path);
         assert_eq!(
@@ -2925,8 +2936,13 @@ model_profiles:
             "llmconduit-turn-capture-{}.toml",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::write(&toml_path, "turn_capture_dir = \"/tmp/llmconduit-turns\"\n")
-            .expect("write toml");
+        std::fs::write(
+            &toml_path,
+            "turn_capture_dir = \"/tmp/llmconduit-turns\"\n\n\
+             [[upstreams]]\nname = \"u\"\nurl = \"http://h/v1\"\n\n\
+             [model_profiles.\"*\"]\nupstream = \"u\"\n",
+        )
+        .expect("write toml");
         let toml_config = Config::from_env_and_file(Some(&toml_path)).expect("load toml config");
         let _ = std::fs::remove_file(&toml_path);
         assert_eq!(
@@ -2950,7 +2966,13 @@ model_profiles:
                 upstream_model: None,
                 fallback_upstreams: None,
             }],
-            model_profiles: OrderedModelProfiles::default(),
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("local".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
             ..PersistedConfig::default()
         };
 
@@ -3038,7 +3060,13 @@ model_profiles:
                     fallback_upstreams: None,
                 },
             ],
-            model_profiles: OrderedModelProfiles::default(),
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("no-key".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
             ..PersistedConfig::default()
         };
         let result = Config::from_persisted(&config).expect("config");
@@ -4144,26 +4172,29 @@ model_profiles:
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn passes_prefixed_model_name_unmodified_when_no_profile() {
-        let config = Config::from_persisted(&PersistedConfig {
-            bind_addr: "127.0.0.1:4010".to_string(),
-            upstream_base_url: None,
-            upstream_api_key: None,
-            upstream_model: None,
+    /// Builds a resolved `Config` directly, bypassing `PersistedConfig` /
+    /// `from_persisted`. Some tests need zero `upstreams` - a state no
+    /// `model_profiles` entry can ever validate against (every profile must
+    /// name a real upstream), so `from_persisted`'s non-empty-profiles guard
+    /// makes it unreachable through the normal persisted-config path.
+    fn config_with_no_upstreams(
+        upstream_request_log_path: Option<PathBuf>,
+        turn_capture_dir: Option<PathBuf>,
+    ) -> Config {
+        Config {
+            bind_addr: "127.0.0.1:4010".parse().expect("socket addr"),
             system_prompt_prefix: None,
-            upstream_request_log_path: None,
-            turn_capture_dir: None,
+            upstream_request_log_path,
+            turn_capture_dir,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
-            fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
-            model_profile_templates: BTreeMap::new(),
-            model_profiles: OrderedModelProfiles::default(),
-            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            model_profiles: Vec::new(),
+            template_family: None,
+            brave_base_url: "https://api.search.brave.com/res/v1".parse().expect("url"),
             brave_api_key: None,
             brave_max_results: 5,
-            request_timeout_secs: 60,
+            request_timeout: std::time::Duration::from_secs(60),
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
             flatten_content: true,
@@ -4172,17 +4203,15 @@ model_profiles:
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: None,
-            vision_url: None,
-            vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: None,
-            model_routes: None,
-            template_family: None,
-            price_table: std::collections::HashMap::new(),
-        })
-        .expect("config");
+            price_table: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn passes_prefixed_model_name_unmodified_when_no_profile() {
+        let config = config_with_no_upstreams(None, None);
 
         assert_eq!(
             config.resolve_upstream_model("anthropic/Kimi-K2.6"),
@@ -4257,13 +4286,10 @@ model_profiles:
         // Empty `upstreams` => single/failover mode, matching the `upstreams`
         // empty branch in `build_app_with_gateway_and_options`. The top-level
         // primary path is the active log path.
-        let config = Config::from_persisted(&PersistedConfig {
-            upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
-            upstreams: Vec::new(),
-            model_profiles: OrderedModelProfiles::default(),
-            ..PersistedConfig::default()
-        })
-        .expect("config");
+        let config = config_with_no_upstreams(
+            Some(PathBuf::from("/tmp/llmconduit-top/primary.jsonl")),
+            None,
+        );
 
         let dirs = config.debug_log_dirs();
         assert_eq!(
@@ -4291,7 +4317,13 @@ model_profiles:
                 upstream_model: None,
                 fallback_upstreams: None,
             }],
-            model_profiles: OrderedModelProfiles::default(),
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("routing".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
             ..PersistedConfig::default()
         })
         .expect("config");
@@ -4315,14 +4347,10 @@ model_profiles:
     /// request-log FILE paths above whose *parent* directory is extracted).
     #[test]
     fn debug_log_dirs_includes_turn_capture_dir() {
-        let config = Config::from_persisted(&PersistedConfig {
-            upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
-            turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
-            upstreams: Vec::new(),
-            model_profiles: OrderedModelProfiles::default(),
-            ..PersistedConfig::default()
-        })
-        .expect("config");
+        let config = config_with_no_upstreams(
+            Some(PathBuf::from("/tmp/llmconduit-top/primary.jsonl")),
+            Some(PathBuf::from("/tmp/llmconduit-turns")),
+        );
 
         let dirs = config.debug_log_dirs();
         assert_eq!(
@@ -4351,7 +4379,13 @@ model_profiles:
                 upstream_model: None,
                 fallback_upstreams: None,
             }],
-            model_profiles: OrderedModelProfiles::default(),
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("routing".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
             ..PersistedConfig::default()
         })
         .expect("config");
@@ -4368,14 +4402,10 @@ model_profiles:
     /// directory already collected from a request-log path.
     #[test]
     fn debug_log_dirs_dedups_turn_capture_dir_against_request_log_dir() {
-        let config = Config::from_persisted(&PersistedConfig {
-            upstream_request_log_path: Some("/tmp/llmconduit-shared/requests.jsonl".to_string()),
-            turn_capture_dir: Some("/tmp/llmconduit-shared".to_string()),
-            upstreams: Vec::new(),
-            model_profiles: OrderedModelProfiles::default(),
-            ..PersistedConfig::default()
-        })
-        .expect("config");
+        let config = config_with_no_upstreams(
+            Some(PathBuf::from("/tmp/llmconduit-shared/requests.jsonl")),
+            Some(PathBuf::from("/tmp/llmconduit-shared")),
+        );
 
         let dirs = config.debug_log_dirs();
         assert_eq!(dirs, vec![PathBuf::from("/tmp/llmconduit-shared")]);
@@ -4390,7 +4420,9 @@ model_profiles:
     fn price_table_loads_from_yaml_and_price_for_resolves() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             "price_table:\n  glm-5.1:\n    input_per_1k: 2.0\n    output_per_1k: 6.0\n    \
-             cached_per_1k: 0.5\n  cheap-model:\n    input_per_1k: 0.1\n    output_per_1k: 0.2\n",
+             cached_per_1k: 0.5\n  cheap-model:\n    input_per_1k: 0.1\n    output_per_1k: 0.2\n\
+             upstreams:\n  - name: u\n    url: \"http://h/v1\"\n\
+             model_profiles:\n  \"*\": { upstream: u }\n",
         )
         .expect("yaml parses");
         let config = Config::from_persisted(&persisted).expect("config");
@@ -4482,7 +4514,9 @@ model_profiles:
         // sibling kept.
         let persisted: PersistedConfig = serde_yaml::from_str(
             "price_table:\n  good:\n    input_per_1k: 2.0\n    output_per_1k: 6.0\n  bad-inf:\n    \
-             input_per_1k: .inf\n    output_per_1k: 1.0\n",
+             input_per_1k: .inf\n    output_per_1k: 1.0\n\
+             upstreams:\n  - name: u\n    url: \"http://h/v1\"\n\
+             model_profiles:\n  \"*\": { upstream: u }\n",
         )
         .expect("yaml parses");
         let config = Config::from_persisted(&persisted).expect("config");

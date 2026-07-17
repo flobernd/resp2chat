@@ -1744,7 +1744,7 @@ impl Gateway {
         // the dispatched model: the backend request keeps the original request
         // model (below) so the router resolves the failover chain exactly once.
         served_model: String,
-        // G4: `Some` when the image agent is active for this turn — the cache
+        // G4: `Some` when the image agent is active for this turn - the cache
         // session id + analyzer choice the `analyzeImage` executor runs against,
         // and the signal to suppress `analyzeImage` streamed deltas from the
         // client.

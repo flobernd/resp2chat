@@ -16,7 +16,7 @@
 //! numbering resets like claude-relay's stateless replay.
 //!
 //! Module layout (grouped by concern):
-//! - [`cache`] — the per-session LRU+TTL [`ImageCache`] storage/eviction plus
+//! - [`cache`] - the per-session LRU+TTL [`ImageCache`] storage/eviction plus
 //!   [`VisionRequest`], the parsed `analyzeImage` call with its cached images
 //!   resolved.
 //! - [`strip`] — request mutation: strip images to placeholders, inject the
