@@ -149,12 +149,66 @@ fn build_configured_persisted_config(
     }
 }
 
+/// Warns before the wizard flattens an existing config: `build_configured_persisted_config`
+/// always emits exactly one upstream and one profile, so a hand-edited config
+/// with more than one of either would otherwise lose the rest silently at
+/// write time.
+fn configure_collapse_warning(existing: &PersistedConfig) -> Option<String> {
+    let mut dropped = Vec::new();
+
+    if existing.upstreams.len() > 1 {
+        let names = existing
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        dropped.push(format!("{} upstreams ({names})", existing.upstreams.len()));
+    }
+
+    if existing.model_profiles.0.len() > 1 {
+        let keys = existing
+            .model_profiles
+            .0
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        dropped.push(format!(
+            "{} profiles ({keys})",
+            existing.model_profiles.0.len()
+        ));
+    }
+
+    if dropped.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "The existing config has {} that will be collapsed into a single `default` upstream and \
+         a `\"*\"` profile if you continue.",
+        dropped.join(" and ")
+    ))
+}
+
 pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
     let existing = load_persisted_config(&path)?;
     let theme = ColorfulTheme::default();
 
     println!("Configuring llmconduit");
     println!("Config file: {}", path.display());
+
+    if let Some(warning) = configure_collapse_warning(&existing) {
+        println!("{warning}");
+        let proceed = Confirm::with_theme(&theme)
+            .with_prompt("Continue anyway?")
+            .default(false)
+            .interact()
+            .map_err(|err| format!("failed to confirm config collapse: {err}"))?;
+        if !proceed {
+            return Err("configuration cancelled".to_string());
+        }
+    }
 
     let bind_addr = Input::with_theme(&theme)
         .with_prompt("Bind address")
@@ -344,5 +398,50 @@ mod tests {
         let route = config.resolve_route("anything").expect("route resolves");
         assert_eq!(route.profile.upstream, "default");
         assert_eq!(route.served_model, "my-model");
+    }
+
+    #[test]
+    fn collapse_warning_is_none_for_single_upstream_and_profile() {
+        let existing = PersistedConfig::default();
+
+        assert_eq!(configure_collapse_warning(&existing), None);
+    }
+
+    #[test]
+    fn collapse_warning_names_extra_upstream() {
+        let mut existing = PersistedConfig::default();
+        existing.upstreams.push(PersistedUpstream {
+            name: "secondary".to_string(),
+            url: "http://127.0.0.1:9000/v1".to_string(),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
+            upstream_model: None,
+            fallback_upstreams: None,
+        });
+
+        let warning = configure_collapse_warning(&existing).expect("warns about extra upstream");
+        assert!(
+            warning.contains("secondary"),
+            "expected warning to name the extra upstream, got: {warning}"
+        );
+    }
+
+    #[test]
+    fn collapse_warning_names_extra_profile_keys() {
+        let mut existing = PersistedConfig::default();
+        existing.model_profiles.0.push((
+            "coder".to_string(),
+            PersistedModelProfile {
+                upstream: Some("default".to_string()),
+                ..PersistedModelProfile::default()
+            },
+        ));
+
+        let warning = configure_collapse_warning(&existing).expect("warns about extra profile");
+        assert!(
+            warning.contains("coder"),
+            "expected warning to name the extra profile key, got: {warning}"
+        );
     }
 }
