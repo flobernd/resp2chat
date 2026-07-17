@@ -571,6 +571,20 @@ impl FailoverUpstreamProvider {
     }
 }
 
+/// One step of a request's failover chain: the provider index to dispatch to
+/// plus the model id to POST there. The profile router builds a chain from a
+/// resolved route (primary = served model; each fallback = its entry model or
+/// the served model); the failover/routing clients build one from bare provider
+/// indices via [`FailoverUpstreamClient::static_generation_chain`] /
+/// [`static_proxy_chain`](FailoverUpstreamClient::static_proxy_chain), carrying
+/// the per-provider static rewrite. On the raw-completions proxy path an EMPTY
+/// `model` means "leave the proxied body's own model untouched".
+#[derive(Debug, Clone)]
+pub struct ChainStep {
+    pub provider: usize,
+    pub model: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct FailoverUpstreamClient {
     providers: Vec<FailoverUpstreamProvider>,
@@ -1728,6 +1742,40 @@ impl FailoverUpstreamClient {
             .and_then(|provider| provider.upstream_model.clone())
     }
 
+    /// Chain steps for bare provider indices on the generation path, preserving
+    /// the per-provider static `upstream_model` rewrite (or the request model
+    /// when a provider sends it through unchanged). Lets these clients feed the
+    /// shared `*_with_provider_indices` dispatch, which carries the model per
+    /// step so the profile router can rewrite per fallback entry.
+    fn static_generation_chain(&self, indices: Vec<usize>, request_model: &str) -> Vec<ChainStep> {
+        indices
+            .into_iter()
+            .map(|provider| ChainStep {
+                model: self.providers[provider]
+                    .upstream_model
+                    .clone()
+                    .unwrap_or_else(|| request_model.to_string()),
+                provider,
+            })
+            .collect()
+    }
+
+    /// Chain steps for the raw-completions proxy: the per-provider static
+    /// `upstream_model`, or an EMPTY model that leaves the proxied body's own
+    /// model untouched (passthrough), matching the prior per-provider rewrite.
+    fn static_proxy_chain(&self, indices: Vec<usize>) -> Vec<ChainStep> {
+        indices
+            .into_iter()
+            .map(|provider| ChainStep {
+                model: self.providers[provider]
+                    .upstream_model
+                    .clone()
+                    .unwrap_or_default(),
+                provider,
+            })
+            .collect()
+    }
+
     fn available_provider_indices(&self) -> Vec<usize> {
         let now = Instant::now();
         let states = self
@@ -1857,14 +1905,18 @@ impl FailoverUpstreamClient {
         ))
     }
 
+    /// Rebuild the backend request for one chain step: POST `model` (the step's
+    /// resolved id) and gap-fill the provider's `upstream_chat_kwargs`. The model
+    /// rides on the step so the profile router can rewrite per fallback entry;
+    /// the failover/routing clients pass the provider-static rewrite through
+    /// [`static_generation_chain`](Self::static_generation_chain).
     fn request_for_provider(
         provider: &FailoverUpstreamProvider,
         backend: &BackendChatRequest,
+        model: &str,
     ) -> BackendChatRequest {
         let mut request = backend.request.clone();
-        if let Some(model) = &provider.upstream_model {
-            request.model = model.clone();
-        }
+        request.model = model.to_string();
         merge_chat_kwargs_gap_fill(&mut request, &provider.upstream_chat_kwargs);
         BackendChatRequest {
             request,
@@ -1878,6 +1930,21 @@ impl FailoverUpstreamClient {
             // turn keeps capturing across a failover provider rebuild.
             capture: backend.capture.clone(),
         }
+    }
+
+    /// Provider-static rebuild for the in-crate unit tests that assert the
+    /// `upstream_model` rewrite directly: POST the provider's configured
+    /// `upstream_model`, or the request model when it sends through unchanged.
+    #[cfg(test)]
+    fn request_for_provider_static(
+        provider: &FailoverUpstreamProvider,
+        backend: &BackendChatRequest,
+    ) -> BackendChatRequest {
+        let model = provider
+            .upstream_model
+            .clone()
+            .unwrap_or_else(|| backend.request.model.clone());
+        Self::request_for_provider(provider, backend, &model)
     }
 
     async fn prefetch_first_chunk(
@@ -2030,7 +2097,7 @@ impl FailoverUpstreamClient {
             return Err(self.cooldown_error());
         }
         self.stream_chat_completion_with_provider_indices(
-            vec![provider_index],
+            self.static_generation_chain(vec![provider_index], &backend.request.model),
             backend,
             request_timeout,
         )
@@ -2039,14 +2106,15 @@ impl FailoverUpstreamClient {
 
     async fn stream_chat_completion_with_provider_indices(
         &self,
-        provider_indices: Vec<usize>,
+        chain: Vec<ChainStep>,
         backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
         let mut last_error = None;
-        for provider_index in provider_indices {
+        for step in chain {
+            let provider_index = step.provider;
             let provider = &self.providers[provider_index];
-            let provider_request = Self::request_for_provider(provider, backend);
+            let provider_request = Self::request_for_provider(provider, backend, &step.model);
             // Gap 03: per-attempt provenance. `start_ms` is the wall-clock the dispatch
             // is issued; the provider's on-wire model is `provider_request.request.model`
             // (post `request_for_provider` remap). The attempt's outcome (served / failed)
@@ -2283,18 +2351,21 @@ impl FailoverUpstreamClient {
                 "resolved fallback provider index was out of range",
             ));
         }
-        self.count_tokens_with_provider_indices(vec![provider_index], backend)
-            .await
+        self.count_tokens_with_provider_indices(
+            self.static_generation_chain(vec![provider_index], &backend.request.model),
+            backend,
+        )
+        .await
     }
 
     async fn count_tokens_with_provider_indices(
         &self,
-        provider_indices: Vec<usize>,
+        chain: Vec<ChainStep>,
         backend: &BackendChatRequest,
     ) -> AppResult<Option<u64>> {
-        for provider_index in provider_indices {
-            let provider = &self.providers[provider_index];
-            let provider_request = Self::request_for_provider(provider, backend);
+        for step in chain {
+            let provider = &self.providers[step.provider];
+            let provider_request = Self::request_for_provider(provider, backend, &step.model);
             match provider.client.count_tokens(&provider_request).await {
                 Ok(Some(count)) => return Ok(Some(count)),
                 Ok(None) => {}
@@ -2322,20 +2393,30 @@ impl FailoverUpstreamClient {
         if !self.provider_is_available(provider_index) {
             return Err(self.cooldown_error());
         }
-        self.proxy_completions_with_provider_indices(vec![provider_index], headers, body)
-            .await
+        self.proxy_completions_with_provider_indices(
+            self.static_proxy_chain(vec![provider_index]),
+            headers,
+            body,
+        )
+        .await
     }
 
     async fn proxy_completions_with_provider_indices(
         &self,
-        provider_indices: Vec<usize>,
+        chain: Vec<ChainStep>,
         headers: HeaderMap,
         body: Bytes,
     ) -> AppResult<reqwest::Response> {
         let mut last_error = None;
-        for provider_index in provider_indices {
-            let provider = &self.providers[provider_index];
-            let provider_body = proxy_body_for_provider(provider, &body);
+        for step in chain {
+            let provider_index = step.provider;
+            // An empty step model leaves the proxied body's own model untouched
+            // (bare-provider passthrough); a non-empty one rewrites it.
+            let provider_body = if step.model.is_empty() {
+                body.clone()
+            } else {
+                proxy_body_with_model(body.clone(), &step.model)
+            };
             match self.providers[provider_index]
                 .client
                 .proxy_completions(headers.clone(), provider_body)
@@ -2792,7 +2873,7 @@ impl UpstreamClient for FailoverUpstreamClient {
             return Err(self.cooldown_error());
         }
         self.stream_chat_completion_with_provider_indices(
-            provider_indices,
+            self.static_generation_chain(provider_indices, &backend.request.model),
             backend,
             request_timeout,
         )
@@ -2804,8 +2885,11 @@ impl UpstreamClient for FailoverUpstreamClient {
         if provider_indices.is_empty() {
             return Ok(None);
         }
-        self.count_tokens_with_provider_indices(provider_indices, backend)
-            .await
+        self.count_tokens_with_provider_indices(
+            self.static_generation_chain(provider_indices, &backend.request.model),
+            backend,
+        )
+        .await
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -2839,8 +2923,12 @@ impl UpstreamClient for FailoverUpstreamClient {
         if provider_indices.is_empty() {
             return Err(self.cooldown_error());
         }
-        self.proxy_completions_with_provider_indices(provider_indices, headers, body)
-            .await
+        self.proxy_completions_with_provider_indices(
+            self.static_proxy_chain(provider_indices),
+            headers,
+            body,
+        )
+        .await
     }
 
     /// Typed plan: a failover chain's candidate set is each provider's
@@ -3202,6 +3290,276 @@ impl UpstreamClient for RoutingUpstreamClient {
                 UpstreamModelEntry { id, context_limit }
             })
             .collect())
+    }
+}
+
+/// Trimmed, ASCII-case-insensitive upstream name, matching `Config::upstream_by_name`
+/// so a profile's upstream reference resolves to a provider regardless of case.
+fn normalize_upstream_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+/// Profile-driven routing client. Resolves each request model to a model profile
+/// (`Config::resolve_route`) and dispatches over that profile's failover chain -
+/// the primary named upstream plus its declared fallbacks. Every profile shares
+/// ONE `FailoverUpstreamProvider` per named upstream, so cooldown is keyed by
+/// upstream name and observed across all profiles that route to it.
+pub struct ProfileRoutingClient {
+    config: Arc<crate::config::Config>,
+    /// One provider per `config.upstreams` entry (index = position), wrapped in a
+    /// single failover client. Reusing the failover client keeps the shared
+    /// per-upstream cooldown state and the `*_with_provider_indices` dispatch
+    /// unchanged; the profile chain rides on the per-step model.
+    failover: FailoverUpstreamClient,
+    /// Normalized upstream name -> provider index, resolving a profile's
+    /// primary/fallback upstream references to a chain step.
+    by_name: HashMap<String, usize>,
+    /// Cached per-provider `/v1/models` snapshot: per-provider context limits for
+    /// pre-flight budgeting plus the union catalog for metadata consumers.
+    /// TTL-refreshed like the routing client's catalog.
+    catalog: Arc<AsyncMutex<Option<CachedProfileModelCatalog>>>,
+}
+
+#[derive(Clone)]
+struct ProfileModelCatalog {
+    /// Per provider index: model id -> reported context-window length.
+    provider_context_limits: Vec<HashMap<String, i64>>,
+    /// Union of every provider's catalog entries (first-seen id wins), for the
+    /// metadata `supported_model_catalog` consumers.
+    union: Vec<UpstreamModelEntry>,
+}
+
+struct CachedProfileModelCatalog {
+    fetched_at: Instant,
+    catalog: ProfileModelCatalog,
+}
+
+impl ProfileRoutingClient {
+    pub fn new(
+        config: Arc<crate::config::Config>,
+        providers: Vec<FailoverUpstreamProvider>,
+    ) -> Self {
+        let by_name = providers
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| (normalize_upstream_name(&provider.name), index))
+            .collect();
+        let cooldown = Duration::from_secs(config.upstream_failure_cooldown_secs);
+        Self {
+            config,
+            failover: FailoverUpstreamClient::new(providers, cooldown),
+            by_name,
+            catalog: Arc::new(AsyncMutex::new(None)),
+        }
+    }
+
+    /// Resolve `request_model` to its profile's failover chain: the primary step
+    /// (served model) followed by one step per declared fallback (the entry's
+    /// model override, else the served model). `AppError::not_found` when no
+    /// profile matches, so an unserved model surfaces a clean 404.
+    fn chain_for(&self, request_model: &str) -> AppResult<Vec<ChainStep>> {
+        let route = self.config.resolve_route(request_model).ok_or_else(|| {
+            AppError::not_found(format!(
+                "model {request_model:?} is not served by any configured model profile"
+            ))
+        })?;
+        let mut chain = Vec::with_capacity(1 + route.profile.fallbacks.len());
+        chain.push(ChainStep {
+            provider: self.provider_index(&route.profile.upstream)?,
+            model: route.served_model.clone(),
+        });
+        for fallback in &route.profile.fallbacks {
+            chain.push(ChainStep {
+                provider: self.provider_index(&fallback.upstream)?,
+                model: fallback
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| route.served_model.clone()),
+            });
+        }
+        Ok(chain)
+    }
+
+    fn provider_index(&self, upstream_name: &str) -> AppResult<usize> {
+        self.by_name
+            .get(&normalize_upstream_name(upstream_name))
+            .copied()
+            .ok_or_else(|| {
+                AppError::internal(format!(
+                    "model profile references unknown upstream {upstream_name:?}"
+                ))
+            })
+    }
+
+    /// Drop chain steps whose provider is currently cooling, so a shared upstream
+    /// already in cooldown (from another profile's failure) is skipped rather than
+    /// re-contacted.
+    fn available_chain(&self, chain: Vec<ChainStep>) -> Vec<ChainStep> {
+        chain
+            .into_iter()
+            .filter(|step| self.failover.provider_is_available(step.provider))
+            .collect()
+    }
+
+    fn first_provider(&self) -> AppResult<&FailoverUpstreamProvider> {
+        self.failover
+            .providers
+            .first()
+            .ok_or_else(|| AppError::internal("profile routing client has no configured upstreams"))
+    }
+
+    async fn load_catalog(&self) -> AppResult<ProfileModelCatalog> {
+        let mut cache = self.catalog.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS
+        {
+            return Ok(cached.catalog.clone());
+        }
+        let catalog = self.refresh_catalog().await?;
+        *cache = Some(CachedProfileModelCatalog {
+            fetched_at: Instant::now(),
+            catalog: catalog.clone(),
+        });
+        Ok(catalog)
+    }
+
+    async fn refresh_catalog(&self) -> AppResult<ProfileModelCatalog> {
+        let mut provider_context_limits = Vec::with_capacity(self.failover.providers.len());
+        let mut union: Vec<UpstreamModelEntry> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut last_error = None;
+        for provider in &self.failover.providers {
+            let entries = match provider.client.supported_model_catalog().await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %provider.name,
+                        error = %err,
+                        "failed to load upstream model catalog"
+                    );
+                    last_error = Some(err);
+                    Vec::new()
+                }
+            };
+            let mut limits = HashMap::new();
+            for entry in entries {
+                if let Some(limit) = entry.context_limit {
+                    limits.insert(entry.id.clone(), limit);
+                }
+                if seen.insert(entry.id.clone()) {
+                    union.push(entry);
+                }
+            }
+            provider_context_limits.push(limits);
+        }
+        // Best-effort union: some providers may have failed. Only propagate an
+        // error when nothing at all loaded, so a single unreachable upstream does
+        // not blank the catalog.
+        if union.is_empty()
+            && let Some(err) = last_error
+        {
+            return Err(err);
+        }
+        Ok(ProfileModelCatalog {
+            provider_context_limits,
+            union,
+        })
+    }
+}
+
+#[async_trait]
+impl UpstreamClient for ProfileRoutingClient {
+    async fn stream_chat_completion(
+        &self,
+        backend: &BackendChatRequest,
+    ) -> AppResult<UpstreamStream> {
+        self.stream_chat_completion_with_timeout(backend, Duration::from_secs(60))
+            .await
+    }
+
+    async fn stream_chat_completion_with_timeout(
+        &self,
+        backend: &BackendChatRequest,
+        request_timeout: Duration,
+    ) -> AppResult<UpstreamStream> {
+        let chain = self.available_chain(self.chain_for(&backend.request.model)?);
+        if chain.is_empty() {
+            return Err(self.failover.cooldown_error());
+        }
+        self.failover
+            .stream_chat_completion_with_provider_indices(chain, backend, request_timeout)
+            .await
+    }
+
+    async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
+        let Ok(chain) = self.chain_for(&backend.request.model) else {
+            return Ok(None);
+        };
+        let chain = self.available_chain(chain);
+        if chain.is_empty() {
+            return Ok(None);
+        }
+        self.failover
+            .count_tokens_with_provider_indices(chain, backend)
+            .await
+    }
+
+    async fn list_models(&self) -> AppResult<reqwest::Response> {
+        // Placeholder: proxy the first configured upstream's listing until the
+        // profile-derived `/v1/models` is built.
+        self.first_provider()?.client.list_models().await
+    }
+
+    async fn proxy_completions(
+        &self,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> AppResult<reqwest::Response> {
+        let requested_model = proxy_body_model(&body).unwrap_or_default();
+        let chain = self.available_chain(self.chain_for(&requested_model)?);
+        if chain.is_empty() {
+            return Err(self.failover.cooldown_error());
+        }
+        self.failover
+            .proxy_completions_with_provider_indices(chain, headers, body)
+            .await
+    }
+
+    async fn supported_model_catalog(&self) -> AppResult<Vec<UpstreamModelEntry>> {
+        Ok(self.load_catalog().await?.union)
+    }
+
+    /// The resolved chain's steps, each with its step model plus that provider's
+    /// catalog context limit (provider-identity scoped, so a coincidental id
+    /// match across upstreams never borrows the wrong window). Preserves the
+    /// conservative-min budgeting the engine applies over the candidate set. An
+    /// unserved model yields an empty set (budgeting no-ops); a catalog-load
+    /// failure keeps the chain's models with unknown limits.
+    async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
+        let Ok(chain) = self.chain_for(requested_model) else {
+            return BackendCandidatePlan {
+                candidates: Vec::new(),
+            };
+        };
+        let catalog = self.load_catalog().await.ok();
+        let candidates = chain
+            .into_iter()
+            .map(|step| BackendCandidate {
+                context_limit: catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.provider_context_limits.get(step.provider))
+                    .and_then(|limits| limits.get(&step.model).copied()),
+                model: step.model,
+            })
+            .collect();
+        BackendCandidatePlan { candidates }
+    }
+
+    /// Each named upstream reported as its own provider (no routing wrapper, so
+    /// no `route` stamp and no per-chain catalog meta).
+    fn provider_health(&self) -> Vec<ProviderHealth> {
+        self.failover
+            .provider_health_with_route(None, CatalogMeta::default())
     }
 }
 
@@ -4213,13 +4571,6 @@ fn merge_json_value_preserve_destination(destination: &mut Value, source: &Value
                 }
             }
         }
-    }
-}
-
-fn proxy_body_for_provider(provider: &FailoverUpstreamProvider, body: &Bytes) -> Bytes {
-    match provider.upstream_model.as_deref() {
-        Some(model) => proxy_body_with_model(body.clone(), model),
-        None => body.clone(),
     }
 }
 
@@ -5483,7 +5834,8 @@ mod tests {
         );
         // Engine-level request still names a non-Kimi model; the provider remaps.
         let base = family_backend("glm-5.1", None);
-        let mut provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+        let mut provider_request =
+            FailoverUpstreamClient::request_for_provider_static(&provider, &base);
         assert_eq!(provider_request.request.model, "kimi-k2-instruct");
         // Leaf injects family from the FINAL (remapped) model.
         apply_family_chat_template_kwargs(&mut provider_request, &empty_policies());
@@ -5517,7 +5869,8 @@ mod tests {
         let mut base = family_backend("m", None);
         base.request.stop = Some(vec!["CLIENT".to_string()]);
 
-        let provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+        let provider_request =
+            FailoverUpstreamClient::request_for_provider_static(&provider, &base);
 
         assert_eq!(
             provider_request.request.stop,
@@ -5556,7 +5909,8 @@ mod tests {
             .extra_body
             .insert("max_completion_tokens".to_string(), json!(256));
 
-        let provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+        let provider_request =
+            FailoverUpstreamClient::request_for_provider_static(&provider, &base);
 
         assert!(
             !provider_request
@@ -6392,7 +6746,7 @@ mod tests {
             None,
             JsonMap::new(),
         );
-        let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
+        let rebuilt = FailoverUpstreamClient::request_for_provider_static(&provider, &backend);
         assert_eq!(rebuilt.response_id.as_deref(), Some("resp_failover"));
         let orig = backend.serving.as_ref().expect("original token");
         let reb = rebuilt.serving.as_ref().expect("rebuilt token");
@@ -6472,7 +6826,8 @@ mod tests {
             std::thread::spawn(move || {
                 // The routing layer tags route on the rebuilt request's token; the
                 // failover layer tags provider on first-chunk success.
-                let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
+                let rebuilt =
+                    FailoverUpstreamClient::request_for_provider_static(&provider, &backend);
                 rebuilt.serving.as_ref().unwrap().set_route(route);
                 rebuilt
                     .serving
