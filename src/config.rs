@@ -553,9 +553,6 @@ pub enum UnsupportedImagePolicy {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
-    pub upstream_base_url: Url,
-    pub upstream_api_key: Option<String>,
-    pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub upstream_request_log_path: Option<PathBuf>,
     /// F1 (Topic F): opt-in durable per-turn capture directory. When set,
@@ -566,18 +563,11 @@ pub struct Config {
     pub turn_capture_dir: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstreams: Vec<UpstreamConfig>,
-    pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
     /// Request-model routing table in DECLARATION order: each entry is a
     /// profile key (literal or glob), its compiled matcher, and the resolved
     /// profile. `resolve_route` scans it exact-first, then globs first-match.
     pub model_profiles: Vec<CompiledProfile>,
-    /// Vestigial ad-hoc model routes: `from_persisted` now always leaves this
-    /// empty, since request-model routing is expressed through `model_profiles`.
-    /// The field and its consumers stay until Tasks 6-7 delete the runtime
-    /// routing machinery; an exact catalog model id still beats a glob when a
-    /// route is present, and declaration order decides between overlapping globs.
-    pub model_routes: Vec<ModelRoute>,
     /// Forces the backend chat-template contract (`kimi`/`deepseek`) regardless
     /// of the model name, when family auto-detection from the model id is wrong
     /// (G2). Profile-level `template_family` overrides this global value.
@@ -789,48 +779,6 @@ pub struct UpstreamConfig {
     pub api_key: Option<String>,
     pub chat_kwargs: JsonMap<String, JsonValue>,
     pub request_log_path: Option<PathBuf>,
-}
-
-/// A resolved ad-hoc model route (G7): request-model name → synthetic upstream.
-#[derive(Debug, Clone)]
-pub struct ModelRoute {
-    /// The request-model name this route matches. May be a literal id or a glob
-    /// pattern (`*`, `?`, `[...]`) such as `claude-opus-*`.
-    pub name: String,
-    /// Compiled, case-insensitive matcher when `name` is a glob pattern; `None`
-    /// for a literal name (matched with `eq_ignore_ascii_case`). Compiled once
-    /// here so an invalid pattern is a clean startup error, not a later panic.
-    pub glob: Option<Regex>,
-    /// Base URL of the synthetic upstream this route forwards to.
-    pub upstream_base_url: Url,
-    /// Optional upstream model id to send to that upstream. When `None`, the
-    /// request model flows through unchanged.
-    pub upstream_model: Option<String>,
-}
-
-impl PartialEq for ModelRoute {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.glob.as_ref().map(Regex::as_str) == other.glob.as_ref().map(Regex::as_str)
-            && self.upstream_base_url == other.upstream_base_url
-            && self.upstream_model == other.upstream_model
-    }
-}
-
-/// Whether `model` matches ANY of `routes` by exact name (case-insensitive) or
-/// glob. The single route-matching primitive shared by config-side route checks
-/// and the routing catalog's dispatch (`RoutingModelCatalog::match_route` returns
-/// the SPECIFIC matching route for dispatch; this is the boolean projection).
-/// Trims + rejects empty input.
-pub fn route_matches(routes: &[ModelRoute], model: &str) -> bool {
-    let trimmed = model.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    routes.iter().any(|route| match &route.glob {
-        Some(glob) => glob.is_match(trimmed),
-        None => route.name.eq_ignore_ascii_case(trimmed),
-    })
 }
 
 /// A single fallback hop for a model profile: the named `upstreams:` entry to
@@ -1182,17 +1130,6 @@ pub struct ReasoningEffortPolicy {
     pub upstream_reasoning: Option<ReasoningConfig>,
 }
 
-#[derive(Debug, Clone)]
-pub struct FallbackUpstreamConfig {
-    pub name: String,
-    pub upstream_base_url: Url,
-    pub upstream_api_key: Option<String>,
-    pub upstream_model: Option<String>,
-    pub exposed_model: Option<String>,
-    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    pub upstream_request_log_path: Option<PathBuf>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedUpstream {
     pub name: String,
@@ -1469,19 +1406,9 @@ impl Config {
     /// inventing a second log-path concept.
     ///
     /// This mirrors how `build_app_with_gateway_and_options` wires upstreams:
-    /// - Routing mode (`upstreams` non-empty): only the per-routing-upstream
-    ///   paths and their nested fallbacks are active. The top-level
-    ///   `upstream_request_log_path` and the global `fallback_upstreams` are
-    ///   ignored by the gateway, so they are excluded here too.
-    /// - Single/failover mode (`upstreams` empty): the top-level path plus the
-    ///   global `fallback_upstreams` paths are active.
-    /// - Explicit-upstream routing (`upstreams` non-empty, no `model_routes`):
-    ///   per-routing-upstream primaries and their nested fallbacks.
-    /// - Routes-only (`model_routes` non-empty, `upstreams` empty): route
-    ///   providers all write the top-level `upstream_request_log_path`, so the
-    ///   single/failover branch covers them.
-    /// - Mixed (`upstreams` + `model_routes`): per-routing-upstream paths PLUS
-    ///   the top-level path (route providers always use the top-level path).
+    /// the gateway builds one provider per `upstreams` entry, so only the
+    /// per-upstream `request_log_path`s are active. When `upstreams` is empty the
+    /// top-level `upstream_request_log_path` is the sole request-log path.
     ///
     /// F1: `turn_capture_dir`, when set, is ALWAYS included (unconditionally,
     /// last) regardless of routing/failover mode -- it is a single
@@ -1504,24 +1431,14 @@ impl Config {
         };
 
         if self.upstreams.is_empty() {
-            // Single/failover OR routes-only mode: top-level primary + global
-            // fallbacks. Route providers (G7) all write the top-level path, so
-            // this branch covers routes-only configs too.
+            // No named upstreams: the top-level primary path is the sole active
+            // request-log path.
             push_dir(self.upstream_request_log_path.as_ref());
-            for fallback in &self.fallback_upstreams {
-                push_dir(fallback.upstream_request_log_path.as_ref());
-            }
         } else {
-            // Explicit-upstream routing mode: per-routing-upstream primaries.
+            // One provider per `upstreams` entry: only their per-upstream paths
+            // are written to.
             for upstream in &self.upstreams {
                 push_dir(upstream.request_log_path.as_ref());
-            }
-            // In mixed mode (`upstreams` + `model_routes`), route providers
-            // still write the top-level `upstream_request_log_path`, which the
-            // loop above does not include. Add it so route-log dirs are cleaned
-            // too (no-op dedup if it coincides with a routing-upstream path).
-            if !self.model_routes.is_empty() {
-                push_dir(self.upstream_request_log_path.as_ref());
             }
         }
         // F1: `turn_capture_dir` IS the directory artifacts land in directly
@@ -1552,12 +1469,6 @@ impl Config {
         validate_model_profiles(&model_profiles, &upstreams)?;
         Ok(Self {
             bind_addr,
-            // Vestigial single-upstream fields kept compiling with inert defaults;
-            // Tasks 6-9 delete them once profile routing owns dispatch.
-            upstream_base_url: Url::parse(DEFAULT_UPSTREAM_BASE_URL)
-                .expect("DEFAULT_UPSTREAM_BASE_URL is a valid URL"),
-            upstream_api_key: None,
-            upstream_model: None,
             system_prompt_prefix: config
                 .system_prompt_prefix
                 .as_ref()
@@ -1577,10 +1488,8 @@ impl Config {
                 .map(PathBuf::from),
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
             upstreams,
-            fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
             model_profiles,
-            model_routes: Vec::new(),
             template_family: normalize_template_family(config.template_family.as_deref()),
             brave_base_url,
             brave_api_key: config
@@ -1626,8 +1535,6 @@ impl Config {
     pub fn resolve_upstream_model(&self, request_model: &str) -> String {
         self.resolve_route(request_model)
             .map(|route| route.served_model)
-            // Vestigial global override, kept until the legacy field is removed.
-            .or_else(|| self.upstream_model.clone())
             .unwrap_or_else(|| request_model.trim().to_string())
     }
 
@@ -1731,31 +1638,16 @@ impl Config {
         })
     }
 
-    /// Whether `model` matches an ad-hoc `model_routes` entry by exact name
-    /// (case-insensitive) or glob, via the shared [`route_matches`] primitive
-    /// (the SAME boolean projection `RoutingModelCatalog::match_route` uses for
-    /// dispatch, G7). The engine consults this so a route-bound request model is
-    /// NOT pre-collapsed to a catalog/default model before the routing client can
-    /// dispatch it. Slots between an exact catalog id and the canonical-key/
-    /// default fallbacks: callers must check an exact catalog id FIRST so a
-    /// catalog id still beats a route.
-    pub fn matches_model_route(&self, model: &str) -> bool {
-        route_matches(&self.model_routes, model)
-    }
-
-    /// Plain single-provider mode: no `upstreams` (routing), no `model_routes`
-    /// (ad-hoc routes), no top-level `fallback_upstreams` (non-routing failover).
-    /// In this mode the engine's own `/v1/models` catalog IS the single served
-    /// provider, so G3 budgeting may fall back to it when the candidate plan has
-    /// no known window. In any other mode the candidate plan is the authoritative
-    /// resolver (routing/failover rewrites the model pre-first-chunk), so the
-    /// engine union catalog must NOT be used as a budgeting fallback — it could
-    /// mask a failover target's smaller window or budget a routed model against
-    /// the wrong window (T9).
+    /// Plain single-provider mode: no named `upstreams`. In this mode the
+    /// engine's own `/v1/models` catalog IS the single served provider, so G3
+    /// budgeting may fall back to it when the candidate plan has no known window.
+    /// In any other mode the candidate plan is the authoritative resolver
+    /// (profile routing rewrites the model pre-first-chunk), so the engine union
+    /// catalog must NOT be used as a budgeting fallback — it could mask a
+    /// failover target's smaller window or budget a routed model against the
+    /// wrong window (T9).
     pub fn is_plain_single_provider(&self) -> bool {
         self.upstreams.is_empty()
-            && self.model_routes.is_empty()
-            && self.fallback_upstreams.is_empty()
     }
 
     /// Per-BACKEND-MODEL reasoning-effort policies for exact leaf lookup, keyed

@@ -3035,27 +3035,19 @@ impl Gateway {
                 return (model.to_string(), true);
             }
         };
-        // Precedence (mirrors `RoutingModelCatalog::resolve`, G7; route-match
-        // uses the shared `config::route_matches` primitive):
+        // Precedence:
         //   1. exact catalog id (an exact id always wins),
-        //   2. ad-hoc route match (exact name or glob) -> pass the model through
-        //      UNCHANGED so the routing client dispatches the route instead of
-        //      collapsing an unknown route name to the catalog default,
-        //   3. unique canonical-key catalog match,
-        //   4. default catalog id.
-        // The ladder is duplicated here vs `RoutingModelCatalog::resolve` because
-        // the engine normalizes against its own `UpstreamModelCatalog` (which also
-        // carries G3 context limits for G3 budgeting) rather than the routing
-        // client's catalog. T2 collapsed the GATING side-channel
-        // (`request_model_genuinely_resolves` deleted; `genuine` is now a
-        // byproduct of this walk, and the gate's candidates come from a typed
-        // `BackendCandidatePlan` on the routing layer). The ladder DEDUP here
-        // remains because `UpstreamModelCatalog::context_limit_by_id` feeds G3
-        // budgeting, which T9 moves behind route/provider resolution — at which
-        // point this fn delegates to the routing catalog and the ladder
-        // collapses. Without step 2, a mixed `upstreams` + `model_routes` config
-        // would pre-normalize a route-only model to the catalog default here and
-        // the route would never fire.
+        //   2. unique canonical-key catalog match,
+        //   3. default catalog id.
+        // The engine normalizes against its own `UpstreamModelCatalog` (which
+        // also carries G3 context limits for G3 budgeting). T2 collapsed the
+        // GATING side-channel (`request_model_genuinely_resolves` deleted;
+        // `genuine` is now a byproduct of this walk, and the gate's candidates
+        // come from a typed `BackendCandidatePlan` on the routing layer). The
+        // ladder DEDUP here remains because
+        // `UpstreamModelCatalog::context_limit_by_id` feeds G3 budgeting, which
+        // T9 moves behind route/provider resolution — at which point this fn
+        // delegates to the routing catalog and the ladder collapses.
         if let Some(exact) = catalog.exact_id(model) {
             if exact != model {
                 tracing::info!(
@@ -3065,11 +3057,6 @@ impl Gateway {
                 );
             }
             return (exact, true);
-        }
-        if self.config.matches_model_route(model) {
-            // Leave the model as-is; `RoutingUpstreamClient::resolve` performs
-            // the route match + upstream-model rewrite. A route match is genuine.
-            return (model.to_string(), true);
         }
         if let Some(canonical) = catalog.canonical_unique(model) {
             if canonical != model {

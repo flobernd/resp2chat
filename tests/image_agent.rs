@@ -62,6 +62,16 @@ use wiremock::matchers::path;
 // `tests/common`; only the assertions are below.
 // ===========================================================================
 
+/// Point `config` at a single `primary` upstream at `base` with a `"*"` catch-all
+/// profile - the profile-era replacement for the removed single `upstream_base_url`.
+fn route_all_to(config: &mut llmconduit::config::Config, base: &str) {
+    let routed = common::config_from_yaml(&format!(
+        "upstreams:\n  - name: primary\n    url: \"{base}/v1/\"\nmodel_profiles:\n  \"*\":\n    upstream: primary\n"
+    ));
+    config.upstreams = routed.upstreams;
+    config.model_profiles = routed.model_profiles;
+}
+
 #[tokio::test]
 async fn image_agent_runs_analyze_image_then_answers() {
     // Round 1: model calls analyzeImage. Round 2: model answers with the
@@ -1465,8 +1475,8 @@ async fn upstream_request_log_redacts_image_data_when_agent_disabled() {
     // the wire (and thus the log), keeping this test's actual target intact:
     // the JSONL log redaction for a raw image that DOES flow through (still a
     // live path -- native-vision passthrough is intentionally unstripped).
-    config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
-    config.upstream_request_log_path = Some(log_path.clone());
+    route_all_to(&mut config, &server.uri());
+    config.upstreams[0].request_log_path = Some(log_path.clone());
     let app = llmconduit::build_app(config);
 
     let body = json!({
@@ -1745,7 +1755,7 @@ async fn upstream_chat_error_body_with_image_url_is_redacted_in_failed() {
     // 400 error BODY, not from the request, so the placeholder swap does not
     // affect these assertions.
     config.image_agent_enabled = false;
-    config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
+    route_all_to(&mut config, &server.uri());
     let (_app, gateway) = llmconduit::build_app_with_gateway(config);
 
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
@@ -2425,8 +2435,8 @@ async fn e2b_ac9_no_image_bytes_in_upstream_jsonl_log_for_degraded_turn() {
     // incident's exact shape. Placeholder policy is the default.
     let mut config = test_config();
     config.brave_api_key = None;
-    config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
-    config.upstream_request_log_path = Some(log_path.clone());
+    route_all_to(&mut config, &server.uri());
+    config.upstreams[0].request_log_path = Some(log_path.clone());
     let app = llmconduit::build_app(config);
 
     let body = json!({

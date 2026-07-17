@@ -4,9 +4,8 @@ use axum::http::Request;
 use futures::StreamExt;
 use futures::stream;
 use llmconduit::config::Config;
-use llmconduit::config::FallbackUpstreamConfig;
+use llmconduit::config::PersistedConfig;
 use llmconduit::config::UnsupportedImagePolicy;
-use llmconduit::config::UpstreamConfig;
 use llmconduit::engine::Gateway;
 use llmconduit::models::chat::ChatChunkChoice;
 use llmconduit::models::chat::ChatCompletionChunk;
@@ -641,76 +640,6 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
 }
 
 #[tokio::test]
-async fn uses_configured_upstream_model_override() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![
-            Ok(content_chunk("chat-1", "hello")),
-            Ok(usage_chunk("chat-1", 12, 5, 17, Some(3), Some(2))),
-        ])
-        .await;
-    let gateway = test_gateway_with_config(
-        upstream.clone(),
-        MockSearch::default(),
-        Config {
-            bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-            upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: Some("grok-4".to_string()),
-            system_prompt_prefix: None,
-            upstream_request_log_path: None,
-            turn_capture_dir: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
-            upstream_failure_cooldown_secs: 30,
-            model_profiles: Vec::new(),
-            model_routes: Vec::new(),
-            template_family: None,
-            brave_base_url: "https://example.com/".parse().expect("url"),
-            brave_api_key: None,
-            brave_max_results: 5,
-            request_timeout: std::time::Duration::from_secs(30),
-            connect_timeout_secs: 10,
-            max_web_search_rounds: 5,
-            flatten_content: true,
-            max_replay_entries: 1000,
-            debug_log_max_age_hours: None,
-            min_completion_tokens: 4096,
-            max_sse_frame_bytes: 8 * 1024 * 1024,
-            max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
-            image_cache_max_size: 100,
-            image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            price_table: std::collections::HashMap::new(),
-        },
-    );
-
-    let _ = collect_stream(
-        gateway
-            .stream_responses(base_request(vec![user_message("hello")]))
-            .await
-            .expect("stream"),
-    )
-    .await;
-
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].model, "grok-4");
-    assert_eq!(
-        requests[0]
-            .stream_options
-            .as_ref()
-            .map(|opts| opts.include_usage),
-        Some(true)
-    );
-    assert_eq!(requests[0].extra_body.get("stream_options"), None);
-}
-
-#[tokio::test]
 async fn normalizes_model_name_from_upstream_catalog() {
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["Qwen3.5"]).await;
@@ -727,68 +656,6 @@ async fn normalizes_model_name_from_upstream_catalog() {
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].model, "Qwen3.5");
-}
-
-#[tokio::test]
-async fn single_supported_backend_model_overrides_configured_model_alias() {
-    let upstream = MockUpstream::default();
-    upstream
-        .set_supported_models(["deepseek-r1-distill-qwen-32b"])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
-        .await;
-    let gateway = test_gateway_with_config(
-        upstream.clone(),
-        MockSearch::default(),
-        Config {
-            bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-            upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: Some("alias-from-config".to_string()),
-            system_prompt_prefix: None,
-            upstream_request_log_path: None,
-            turn_capture_dir: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
-            upstream_failure_cooldown_secs: 30,
-            model_profiles: Vec::new(),
-            model_routes: Vec::new(),
-            template_family: None,
-            brave_base_url: "https://example.com/".parse().expect("url"),
-            brave_api_key: Some("test-key".to_string()),
-            brave_max_results: 5,
-            request_timeout: std::time::Duration::from_secs(30),
-            connect_timeout_secs: 10,
-            max_web_search_rounds: 5,
-            flatten_content: true,
-            max_replay_entries: 1000,
-            debug_log_max_age_hours: None,
-            min_completion_tokens: 4096,
-            max_sse_frame_bytes: 8 * 1024 * 1024,
-            max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
-            image_cache_max_size: 100,
-            image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-            price_table: std::collections::HashMap::new(),
-        },
-    );
-
-    let _ = collect_stream(
-        gateway
-            .stream_responses(base_request(vec![user_message("hello")]))
-            .await
-            .expect("stream"),
-    )
-    .await;
-
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].model, "deepseek-r1-distill-qwen-32b");
 }
 
 #[tokio::test]
@@ -1094,9 +961,6 @@ async fn forwards_configured_upstream_chat_kwargs() {
         MockSearch::default(),
         Config {
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-            upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: Some("GLM-5.1".to_string()),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
@@ -1105,10 +969,8 @@ async fn forwards_configured_upstream_chat_kwargs() {
                 json!(false),
             )]),
             upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: Vec::new(),
-            model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
@@ -1159,15 +1021,11 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
         MockSearch::default(),
         Config {
             bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-            upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
-            fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: vec![llmconduit::config::CompiledProfile {
                 key: "Kimi-K2.6".to_string(),
@@ -1185,7 +1043,6 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                     ..Default::default()
                 },
             }],
-            model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
@@ -2748,137 +2605,6 @@ async fn debug_ws_contract_unchanged_bare_message_route_still_gated() {
 }
 
 #[tokio::test]
-async fn fallback_models_endpoint_filters_to_provider_model_override() {
-    let primary = MockServer::start().await;
-    let fallback = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("primary unavailable"))
-        .mount(&primary)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("etag", "\"fallback-etag\"")
-                .set_body_json(json!({
-                    "object": "list",
-                    "data": [
-                        {"id": "other-model", "object": "model", "owned_by": "fallback"},
-                        {"id": "fallback-model", "object": "model", "owned_by": "fallback"}
-                    ]
-                })),
-        )
-        .mount(&fallback)
-        .await;
-
-    let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("url");
-    config.fallback_upstreams = vec![FallbackUpstreamConfig {
-        name: "fallback".to_string(),
-        upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: Some("fallback-model".to_string()),
-        exposed_model: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstream_request_log_path: None,
-    }];
-
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    assert!(response.headers().get("etag").is_none());
-    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    assert_eq!(
-        body,
-        json!({
-            "object": "list",
-            "data": [
-                {"id": "fallback-model", "object": "model", "owned_by": "fallback"}
-            ]
-        })
-    );
-}
-
-#[tokio::test]
-async fn fallback_models_endpoint_without_provider_model_override_passes_list_through() {
-    let primary = MockServer::start().await;
-    let fallback = MockServer::start().await;
-    let fallback_body = json!({
-        "object": "list",
-        "data": [
-            {"id": "fallback-a", "object": "model"},
-            {"id": "fallback-b", "object": "model"}
-        ]
-    });
-
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("primary unavailable"))
-        .mount(&primary)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("etag", "\"fallback-etag\"")
-                .set_body_json(fallback_body.clone()),
-        )
-        .mount(&fallback)
-        .await;
-
-    let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("url");
-    config.fallback_upstreams = vec![FallbackUpstreamConfig {
-        name: "fallback".to_string(),
-        upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        exposed_model: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstream_request_log_path: None,
-    }];
-
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(
-        response
-            .headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok()),
-        Some("\"fallback-etag\"")
-    );
-    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    assert_eq!(body, fallback_body);
-}
-
-#[tokio::test]
 async fn proxies_models_endpoint_with_etag() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -2893,41 +2619,8 @@ async fn proxies_models_endpoint_with_etag() {
         .mount(&server)
         .await;
 
-    let config = Config {
-        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        system_prompt_prefix: None,
-        upstream_request_log_path: None,
-        turn_capture_dir: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
-        upstream_failure_cooldown_secs: 30,
-        model_profiles: Vec::new(),
-        model_routes: Vec::new(),
-        template_family: None,
-        brave_base_url: "https://example.com/".parse().expect("url"),
-        brave_api_key: None,
-        brave_max_results: 5,
-        request_timeout: std::time::Duration::from_secs(30),
-        connect_timeout_secs: 10,
-        max_web_search_rounds: 5,
-        flatten_content: true,
-        max_replay_entries: 1000,
-        debug_log_max_age_hours: None,
-        min_completion_tokens: 4096,
-        max_sse_frame_bytes: 8 * 1024 * 1024,
-        max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
-        image_cache_max_size: 100,
-        image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-        price_table: std::collections::HashMap::new(),
-    };
+    let mut config = test_config();
+    route_all_to(&mut config, &server.uri());
     let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
@@ -2971,41 +2664,14 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         .mount(&server)
         .await;
 
-    let config = Config {
-        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
-        upstream_api_key: Some("upstream-secret".to_string()),
-        upstream_model: None,
-        system_prompt_prefix: None,
-        upstream_request_log_path: None,
-        turn_capture_dir: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
-        upstream_failure_cooldown_secs: 30,
-        model_profiles: Vec::new(),
-        model_routes: Vec::new(),
-        template_family: None,
-        brave_base_url: "https://example.com/".parse().expect("url"),
-        brave_api_key: None,
-        brave_max_results: 5,
-        request_timeout: std::time::Duration::from_secs(30),
-        connect_timeout_secs: 10,
-        max_web_search_rounds: 5,
-        flatten_content: true,
-        max_replay_entries: 1000,
-        debug_log_max_age_hours: None,
-        min_completion_tokens: 4096,
-        max_sse_frame_bytes: 8 * 1024 * 1024,
-        max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
-        image_cache_max_size: 100,
-        image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-        price_table: std::collections::HashMap::new(),
-    };
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\n    api_key: upstream-secret\nmodel_profiles:\n  \"*\":\n    upstream: primary\n",
+            server.uri()
+        ),
+    );
     let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
@@ -3055,41 +2721,8 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         .mount(&server)
         .await;
 
-    let config = Config {
-        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        system_prompt_prefix: None,
-        upstream_request_log_path: None,
-        turn_capture_dir: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
-        upstream_failure_cooldown_secs: 30,
-        model_profiles: Vec::new(),
-        model_routes: Vec::new(),
-        template_family: None,
-        brave_base_url: "https://example.com/".parse().expect("url"),
-        brave_api_key: None,
-        brave_max_results: 5,
-        request_timeout: std::time::Duration::from_secs(30),
-        connect_timeout_secs: 10,
-        max_web_search_rounds: 5,
-        flatten_content: true,
-        max_replay_entries: 1000,
-        debug_log_max_age_hours: None,
-        min_completion_tokens: 4096,
-        max_sse_frame_bytes: 8 * 1024 * 1024,
-        max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
-        image_cache_max_size: 100,
-        image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-        price_table: std::collections::HashMap::new(),
-    };
+    let mut config = test_config();
+    route_all_to(&mut config, &server.uri());
     let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
@@ -3142,41 +2775,8 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         .mount(&server)
         .await;
 
-    let config = Config {
-        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        system_prompt_prefix: None,
-        upstream_request_log_path: None,
-        turn_capture_dir: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
-        upstream_failure_cooldown_secs: 30,
-        model_profiles: Vec::new(),
-        model_routes: Vec::new(),
-        template_family: None,
-        brave_base_url: "https://example.com/".parse().expect("url"),
-        brave_api_key: None,
-        brave_max_results: 5,
-        request_timeout: std::time::Duration::from_secs(30),
-        connect_timeout_secs: 10,
-        max_web_search_rounds: 5,
-        flatten_content: true,
-        max_replay_entries: 1000,
-        debug_log_max_age_hours: None,
-        min_completion_tokens: 4096,
-        max_sse_frame_bytes: 8 * 1024 * 1024,
-        max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
-        image_cache_max_size: 100,
-        image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-        price_table: std::collections::HashMap::new(),
-    };
+    let mut config = test_config();
+    route_all_to(&mut config, &server.uri());
     let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
@@ -3234,41 +2834,14 @@ async fn proxies_completions_endpoint_passthrough() {
         .mount(&server)
         .await;
 
-    let config = Config {
-        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
-        upstream_api_key: Some("upstream-secret".to_string()),
-        upstream_model: None,
-        system_prompt_prefix: None,
-        upstream_request_log_path: None,
-        turn_capture_dir: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
-        upstream_failure_cooldown_secs: 30,
-        model_profiles: Vec::new(),
-        model_routes: Vec::new(),
-        template_family: None,
-        brave_base_url: "https://example.com/".parse().expect("url"),
-        brave_api_key: None,
-        brave_max_results: 5,
-        request_timeout: std::time::Duration::from_secs(30),
-        connect_timeout_secs: 10,
-        max_web_search_rounds: 5,
-        flatten_content: true,
-        max_replay_entries: 1000,
-        debug_log_max_age_hours: None,
-        min_completion_tokens: 4096,
-        max_sse_frame_bytes: 8 * 1024 * 1024,
-        max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
-        image_cache_max_size: 100,
-        image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
-        price_table: std::collections::HashMap::new(),
-    };
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\n    api_key: upstream-secret\nmodel_profiles:\n  \"*\":\n    upstream: primary\n",
+            server.uri()
+        ),
+    );
     let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
@@ -6048,7 +5621,7 @@ async fn d13_wiremock_app() -> (axum::Router, Arc<Gateway>, MockServer) {
         .await;
 
     let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    route_all_to(&mut config, &server.uri());
     config.price_table = d13_price_table();
     // Loopback bind ⇒ dev-open auth (the routes register, no token required).
     let (app, gateway) = llmconduit::build_app_with_gateway_and_options(
@@ -7003,21 +6576,39 @@ fn test_gateway_with_config_and_raw_output(
     ))
 }
 
+/// Replace `config`'s `upstreams` + `model_profiles` from the `upstreams:` /
+/// `model_profiles:` YAML the production loader parses, so the compiled "*" glob
+/// and fallbacks resolve exactly as in production. Only those two fields are
+/// swapped; the rest of `config` is left as the caller set it.
+fn apply_routing_yaml(config: &mut Config, yaml: &str) {
+    let persisted: PersistedConfig = serde_yaml::from_str(yaml).expect("routing yaml");
+    let routed = Config::from_persisted(&persisted).expect("routing config");
+    config.upstreams = routed.upstreams;
+    config.model_profiles = routed.model_profiles;
+}
+
+/// Point `config` at a single `primary` upstream at `base` (a wiremock URI), with
+/// a `"*"` catch-all profile - the profile-era replacement for the removed
+/// single `upstream_base_url`.
+fn route_all_to(config: &mut Config, base: &str) {
+    apply_routing_yaml(
+        config,
+        &format!(
+            "upstreams:\n  - name: primary\n    url: \"{base}/v1/\"\nmodel_profiles:\n  \"*\":\n    upstream: primary\n"
+        ),
+    );
+}
+
 fn test_config() -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: Vec::new(),
-        model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),
@@ -7387,287 +6978,6 @@ fn conformance_harness_is_reachable_from_gateway_integration_crate() {
     assert_sse_conformant(&events, Surface::TextOnly);
 }
 
-#[tokio::test]
-async fn explicit_upstreams_models_endpoint_returns_primary_union() {
-    let first = MockServer::start().await;
-    let second = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "object": "list",
-            "data": [
-                {"id": "first-model", "object": "model", "owned_by": "first"},
-                {"id": "shared-model", "object": "model", "owned_by": "first"}
-            ]
-        })))
-        .mount(&first)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "object": "list",
-            "data": [
-                {"id": "second-model", "object": "model", "owned_by": "second"},
-                {"id": "shared-model", "object": "model", "owned_by": "second"}
-            ]
-        })))
-        .mount(&second)
-        .await;
-
-    let mut config = test_config();
-    config.upstreams = vec![
-        UpstreamConfig {
-            name: "first".to_string(),
-            url: format!("{}/v1/", first.uri()).parse().expect("url"),
-            api_key: None,
-            chat_kwargs: JsonMap::new(),
-            request_log_path: None,
-        },
-        UpstreamConfig {
-            name: "second".to_string(),
-            url: format!("{}/v1/", second.uri()).parse().expect("url"),
-            api_key: None,
-            chat_kwargs: JsonMap::new(),
-            request_log_path: None,
-        },
-    ];
-
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    assert!(response.headers().get("etag").is_none());
-    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    let ids = body["data"]
-        .as_array()
-        .expect("data array")
-        .iter()
-        .map(|entry| entry["id"].as_str().expect("model id"))
-        .collect::<Vec<_>>();
-    assert_eq!(ids, vec!["first-model", "shared-model", "second-model"]);
-}
-
-#[tokio::test]
-async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
-    let first = MockServer::start().await;
-    let second = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "qwen-3.5"}]
-        })))
-        .mount(&first)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "glm-5.1"}]
-        })))
-        .mount(&second)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({"model": "glm-5.1"})))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(chat_completion_sse_body(&[json!({
-                    "id": "chat-second",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": "second"},
-                        "finish_reason": null
-                    }],
-                    "usage": null
-                })])),
-        )
-        .mount(&second)
-        .await;
-
-    let mut config = test_config();
-    config.upstreams = vec![
-        UpstreamConfig {
-            name: "first".to_string(),
-            url: format!("{}/v1/", first.uri()).parse().expect("url"),
-            api_key: None,
-            chat_kwargs: JsonMap::new(),
-            request_log_path: None,
-        },
-        UpstreamConfig {
-            name: "second".to_string(),
-            url: format!("{}/v1/", second.uri()).parse().expect("url"),
-            api_key: None,
-            chat_kwargs: JsonMap::new(),
-            request_log_path: None,
-        },
-    ];
-
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "GLM 5 1",
-                        "stream": false,
-                        "messages": [{"role": "user", "content": "hi"}]
-                    })
-                    .to_string(),
-                ))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    assert_eq!(body["model"], "glm-5.1");
-    assert_eq!(
-        body["choices"][0]["message"]["content"].as_str(),
-        Some("second")
-    );
-
-    let first_chat_requests = first
-        .received_requests()
-        .await
-        .expect("first requests")
-        .into_iter()
-        .filter(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-        })
-        .count();
-    assert_eq!(first_chat_requests, 0);
-}
-
-#[tokio::test]
-async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstream_model() {
-    let first = MockServer::start().await;
-    let second = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "first-model"}]
-        })))
-        .mount(&first)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "second-model"}]
-        })))
-        .mount(&second)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({"model": "first-model"})))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(chat_completion_sse_body(&[json!({
-                    "id": "chat-first",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": "first"},
-                        "finish_reason": null
-                    }],
-                    "usage": null
-                })])),
-        )
-        .mount(&first)
-        .await;
-
-    let mut config = test_config();
-    config.upstreams = vec![
-        UpstreamConfig {
-            name: "first".to_string(),
-            url: format!("{}/v1/", first.uri()).parse().expect("url"),
-            api_key: None,
-            chat_kwargs: JsonMap::new(),
-            request_log_path: None,
-        },
-        UpstreamConfig {
-            name: "second".to_string(),
-            url: format!("{}/v1/", second.uri()).parse().expect("url"),
-            api_key: None,
-            chat_kwargs: JsonMap::new(),
-            request_log_path: None,
-        },
-    ];
-    let app = llmconduit::build_app(config);
-
-    for body in [
-        json!({
-            "stream": false,
-            "messages": [{"role": "user", "content": "missing"}]
-        }),
-        json!({
-            "model": "not-currently-provided",
-            "stream": false,
-            "messages": [{"role": "user", "content": "unavailable"}]
-        }),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status().as_u16(), 200);
-        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .expect("read body");
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-        assert_eq!(body["model"], "first-model");
-    }
-
-    let first_chat_requests = first
-        .received_requests()
-        .await
-        .expect("first requests")
-        .into_iter()
-        .filter(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-        })
-        .count();
-    let second_chat_requests = second
-        .received_requests()
-        .await
-        .expect("second requests")
-        .into_iter()
-        .filter(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-        })
-        .count();
-    assert_eq!(first_chat_requests, 2);
-    assert_eq!(second_chat_requests, 0);
-}
-
 // ---------------------------------------------------------------------------
 // OpenAI /v1/chat/completions integration tests
 // ---------------------------------------------------------------------------
@@ -7679,7 +6989,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({ "model": "primary-model" })))
+        .and(body_partial_json(json!({ "model": "client-model" })))
         .respond_with(ResponseTemplate::new(503).set_body_string("primary unavailable"))
         .mount(&primary)
         .await;
@@ -7707,49 +7017,37 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
         .await;
 
     let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("url");
-    config.upstream_model = Some("primary-model".to_string());
-    config.fallback_upstreams = vec![FallbackUpstreamConfig {
-        name: "fallback".to_string(),
-        upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: Some("fallback-model".to_string()),
-        exposed_model: None,
-        upstream_chat_kwargs: JsonMap::from_iter([
-            (
-                "provider".to_string(),
-                json!({
-                    "order": ["z-ai"],
-                    "allow_fallbacks": true
-                }),
-            ),
-            (
-                "chat_template_kwargs".to_string(),
-                json!({
-                    "fallback_default": true,
-                    "shared": "fallback"
-                }),
-            ),
-        ]),
-        upstream_request_log_path: None,
-    }];
+    // The `client-model` profile serves its primary upstream and fails over to
+    // `fallback-model` on the `fallback` upstream, which carries its OWN
+    // `chat_kwargs`. The profile's own `chat_template_kwargs` (keyed by the served
+    // `client-model`) must NOT reach the differently-keyed fallback target.
+    let routing_yaml = [
+        "upstreams:",
+        "  - name: primary",
+        &format!("    url: \"{}/v1/\"", primary.uri()),
+        "  - name: fallback",
+        &format!("    url: \"{}/v1/\"", fallback.uri()),
+        "    chat_kwargs:",
+        "      provider:",
+        "        order: [\"z-ai\"]",
+        "        allow_fallbacks: true",
+        "      chat_template_kwargs:",
+        "        fallback_default: true",
+        "        shared: fallback",
+        "model_profiles:",
+        "  client-model:",
+        "    upstream: primary",
+        "    chat_template_kwargs:",
+        "      model_default: true",
+        "      shared: model",
+        "    fallbacks:",
+        "      - upstream: fallback",
+        "        model: fallback-model",
+        "",
+    ]
+    .join("\n");
+    apply_routing_yaml(&mut config, &routing_yaml);
     config.upstream_failure_cooldown_secs = 3600;
-    config.model_profiles = vec![llmconduit::config::CompiledProfile {
-        key: "client-model".to_string(),
-        glob: None,
-        profile: llmconduit::config::ModelProfile {
-            upstream_model: None,
-            system_prompt_prefix: None,
-            upstream_chat_kwargs: JsonMap::from_iter([(
-                "chat_template_kwargs".to_string(),
-                json!({
-                    "model_default": true,
-                    "shared": "model"
-                }),
-            )]),
-            ..Default::default()
-        },
-    }];
 
     let app = llmconduit::build_app(config);
     let request_body = json!({
@@ -9799,18 +9097,13 @@ async fn cancels_mid_stream_when_client_disconnects() {
     let stream_polled = upstream.stream_polled.notified();
     let config = Config {
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: Vec::new(),
-        model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: None,
@@ -10289,7 +9582,7 @@ async fn f1d_ac10_gateway_e2e_upstream_request_is_shrunk_final_request() {
         .await;
 
     let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    route_all_to(&mut config, &server.uri());
     config.turn_capture_dir = Some(capture_dir.clone());
     // `--with-debug-ui` OFF: capture works off its OWN gate (AC-4 principle),
     // proven again here alongside the real-upstream wiring.
@@ -10376,7 +9669,7 @@ async fn f1e_ac12_upstream_response_is_exact_raw_sse_bytes() {
         .await;
 
     let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    route_all_to(&mut config, &server.uri());
     config.turn_capture_dir = Some(capture_dir.clone());
     let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
         config,
@@ -10455,7 +9748,7 @@ async fn f1e_ac13_final_non_2xx_body_captured_status_failed() {
         .await;
 
     let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    route_all_to(&mut config, &server.uri());
     config.turn_capture_dir = Some(capture_dir.clone());
     let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
         config,
@@ -10531,7 +9824,7 @@ async fn f1e_ac14_oversized_frame_partial_and_no_hang() {
         .await;
 
     let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    route_all_to(&mut config, &server.uri());
     config.turn_capture_dir = Some(capture_dir.clone());
     // Floored to 1024 by the leaf; the 4 KiB frame overflows it → the G6 cap trips.
     config.max_sse_frame_bytes = 1024;
@@ -10629,7 +9922,7 @@ async fn f1f_ac16_request_sections_redact_secret_and_image_end_to_end() {
         .await;
 
     let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    route_all_to(&mut config, &server.uri());
     config.turn_capture_dir = Some(capture_dir.clone());
     // Non-vacuous `upstream_request` redaction (F1f review r1): the inbound top-level
     // `api_key` below is DROPPED by `/v1/messages` before lowering (and the images are
@@ -11700,7 +10993,7 @@ async fn e2a_request_intrinsic_400_no_cooldown_structured_anthropic_error() {
         .await;
 
     let mut config = test_config();
-    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    route_all_to(&mut config, &server.uri());
     let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
         config,
         None,

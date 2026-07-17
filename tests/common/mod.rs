@@ -485,18 +485,13 @@ pub const TEST_IMAGE_DATA_URL: &str =
 pub fn test_config() -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-        upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
-        fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: Vec::new(),
-        model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),

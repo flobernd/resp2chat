@@ -206,41 +206,6 @@ async fn template_family_override_forces_family_regardless_of_name() {
     );
 }
 
-/// The resolved model beats a stale configured `upstream_model`: a `kimi`
-/// `upstream_model` that the backend does NOT serve normalizes to the served
-/// DeepSeek model, and the DeepSeek contract (not Kimi) is injected — the
-/// concretely resolved model is authoritative (claude-relay lesson).
-#[tokio::test]
-async fn resolved_model_wins_over_stale_configured_upstream_model() {
-    let upstream = MockUpstream::default();
-    // Backend serves only deepseek-v3; a stale kimi-k2 upstream_model in config
-    // does not match, so normalization falls back to the served model.
-    upstream.set_supported_models(["deepseek-v3"]).await;
-    upstream
-        .push_response(vec![
-            Ok(content_chunk("chat-1", "hi")),
-            Ok(usage_chunk("chat-1", 5, 1, 6)),
-        ])
-        .await;
-    let mut config = test_config();
-    config.upstream_model = Some("kimi-k2".to_string());
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
-    let request = base_request(vec![user_message("hello")]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-
-    let body = serde_json::to_value(&upstream.requests().await[0]).expect("serialize");
-    assert_eq!(
-        body["model"],
-        json!("deepseek-v3"),
-        "resolved to served model"
-    );
-    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
-    assert!(
-        body["chat_template_kwargs"].get("thinking").is_none(),
-        "DeepSeek contract must not carry the Kimi `thinking` key"
-    );
-}
-
 /// Explicit request `extra_body.chat_template_kwargs` wins over injected family
 /// defaults on conflict (deep-merge, request-source-wins).
 #[tokio::test]
@@ -491,13 +456,7 @@ fn profile_leaf(base_uri: &str) -> ReqwestUpstreamClient {
 /// A named-upstream provider (pure endpoint: no per-provider model rewrite; the
 /// profile chain supplies the model per step).
 fn named_provider(name: &str, base_uri: &str) -> FailoverUpstreamProvider {
-    FailoverUpstreamProvider::new(
-        name,
-        profile_leaf(base_uri),
-        None,
-        None,
-        serde_json::Map::new(),
-    )
+    FailoverUpstreamProvider::new(name, profile_leaf(base_uri), None, serde_json::Map::new())
 }
 
 /// An exact-key model profile routing to `upstream` with the given fallbacks.
