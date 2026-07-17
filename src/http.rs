@@ -33,7 +33,6 @@ use crate::models::responses::ResponsesRequest;
 use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
 use crate::upstream::BackendChatRequest;
-use crate::upstream::collect_models_response;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
@@ -67,6 +66,7 @@ use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1925,22 +1925,56 @@ async fn get_models(
     State(gateway): State<Arc<Gateway>>,
 ) -> AppResult<Response> {
     let anthropic_models = is_anthropic_models_request(&headers);
-    let response = gateway.upstream_client().list_models().await?;
-    let (status, body, etag) = collect_models_response(response).await?;
+    let body = profile_models_response(&gateway).await;
     let body = if anthropic_models {
         transform_models_response_for_anthropic(body, &query, gateway.config())?
     } else {
         body
     };
-    let mut headers = HeaderMap::new();
-    if !anthropic_models && let Some(etag) = etag {
-        headers.insert(
-            http::header::ETAG,
-            HeaderValue::from_str(&etag)
-                .map_err(|err| AppError::internal(format!("invalid ETag header: {err}")))?,
-        );
-    }
-    Ok((status, headers, Json(body)).into_response())
+    Ok(Json(body).into_response())
+}
+
+/// The OpenAI-shaped `/v1/models` body built from the configured profiles: one
+/// entry per exact-key profile, in declaration order, no upstream proxy call.
+/// `context_length` is added when the router's unioned model catalog knows the
+/// profile's SERVED model (`upstream_model` if set, else the profile key). A
+/// catalog-load failure is non-fatal - entries just lack `context_length` -
+/// since the profile list itself never depends on any upstream being
+/// reachable.
+async fn profile_models_response(gateway: &Gateway) -> Value {
+    let config = gateway.config();
+    let context_limits: HashMap<String, i64> = gateway
+        .upstream_client()
+        .supported_model_catalog()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| entry.context_limit.map(|limit| (entry.id, limit)))
+        .collect();
+
+    let data: Vec<Value> = config
+        .exact_profile_keys()
+        .map(|key| {
+            let served_model = config
+                .resolve_route(key)
+                .map(|route| route.served_model)
+                .unwrap_or_else(|| key.to_string());
+            let mut entry = serde_json::json!({
+                "id": key,
+                "object": "model",
+                "owned_by": "llmconduit",
+            });
+            if let Some(limit) = context_limits.get(&served_model) {
+                entry["context_length"] = serde_json::json!(limit);
+            }
+            entry
+        })
+        .collect();
+
+    serde_json::json!({
+        "object": "list",
+        "data": data,
+    })
 }
 
 fn is_anthropic_models_request(headers: &HeaderMap) -> bool {

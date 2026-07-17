@@ -2512,61 +2512,12 @@ async fn debug_ws_contract_unchanged_bare_message_route_still_gated() {
 }
 
 #[tokio::test]
-async fn proxies_models_endpoint_with_etag() {
+async fn lists_exact_profiles_as_openai_models() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("etag", "\"etag-1\"")
-                .set_body_json(json!({
-                    "data": [{"id": "glm-5.1"}]
-                })),
-        )
-        .mount(&server)
-        .await;
-
-    let mut config = test_config();
-    route_all_to(&mut config, &server.uri());
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    assert_eq!(
-        response
-            .headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok()),
-        Some("\"etag-1\"")
-    );
-    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    assert_eq!(
-        body,
-        json!({
-            "data": [{"id": "glm-5.1"}]
-        })
-    );
-}
-
-#[tokio::test]
-async fn proxies_models_endpoint_with_upstream_api_key() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .and(header("authorization", "Bearer upstream-secret"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "glm-5.1"}]
+            "data": [{"id": "glm-5.1", "max_model_len": 131072}]
         })))
         .mount(&server)
         .await;
@@ -2575,7 +2526,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
     apply_routing_yaml(
         &mut config,
         &format!(
-            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\n    api_key: upstream-secret\nmodel_profiles:\n  \"*\":\n    upstream: primary\n",
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\nmodel_profiles:\n  glm-5.1:\n    upstream: primary\n  qwen3:\n    upstream: primary\n  \"*\":\n    upstream: primary\n",
             server.uri()
         ),
     );
@@ -2591,6 +2542,68 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         .expect("response");
 
     assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        response.headers().get("etag").is_none(),
+        "the synthesized profile list carries no ETag (dropped along with the proxy path)"
+    );
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(
+        body,
+        json!({
+            "object": "list",
+            "data": [
+                {"id": "glm-5.1", "object": "model", "owned_by": "llmconduit", "context_length": 131072},
+                {"id": "qwen3", "object": "model", "owned_by": "llmconduit"}
+            ]
+        }),
+        "exact profiles in declaration order; context_length only when the upstream \
+         catalog knows the served model; the glob catch-all is absent: {body}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_lookup_authenticates_to_upstream() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer upstream-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1", "max_model_len": 65536}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\n    api_key: upstream-secret\nmodel_profiles:\n  glm-5.1:\n    upstream: primary\n",
+            server.uri()
+        ),
+    );
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    // The mock only answers `/v1/models` when it sees the configured upstream
+    // api_key, so a present `context_length` proves the catalog lookup behind
+    // the synthesized list authenticated correctly.
+    assert_eq!(body["data"][0]["context_length"], 65536, "{body}");
 }
 
 #[tokio::test]
@@ -2598,39 +2611,67 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("etag", "\"upstream-etag\"")
-                .set_body_json(json!({
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "glm-5.1",
-                            "object": "model",
-                            "created": 1760000000,
-                            "owned_by": "zai",
-                            "context_length": 131072,
-                            "max_output_tokens": 8192
-                        },
-                        {
-                            "id": "qwen3",
-                            "created_at": "2025-02-19T00:00:00Z",
-                            "display_name": "Qwen 3",
-                            "capabilities": {
-                                "thinking": {
-                                    "supported": true
-                                }
-                            }
-                        }
-                    ]
-                })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1", "max_model_len": 131072}]
+        })))
         .mount(&server)
         .await;
 
     let mut config = test_config();
-    route_all_to(&mut config, &server.uri());
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\nmodel_profiles:\n  glm-5.1:\n    upstream: primary\n  qwen3:\n    upstream: primary\n    capabilities:\n      thinking:\n        supported: true\n",
+            server.uri()
+        ),
+    );
     let app = llmconduit::build_app(config);
+
+    // No limit: both profiles reshaped, in declaration order, with the
+    // configured per-profile capabilities override merged in for qwen3.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.headers().get("etag").is_none());
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(body["has_more"], false);
+    assert_eq!(body["first_id"], "glm-5.1");
+    assert_eq!(body["last_id"], "qwen3");
+    let models = body["data"].as_array().expect("data array");
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["id"], "glm-5.1");
+    assert_eq!(models[0]["type"], "model");
+    assert_eq!(models[0]["display_name"], "glm-5.1");
+    assert_eq!(models[0]["created_at"], "1970-01-01T00:00:00Z");
+    assert_eq!(models[0]["max_input_tokens"], 131072);
+    assert_eq!(models[0]["max_tokens"], 0);
+    assert_eq!(models[0]["capabilities"]["thinking"]["supported"], false);
+    assert_eq!(models[0]["capabilities"]["image_input"]["supported"], false);
+    assert_eq!(
+        models[0]["capabilities"]["structured_outputs"]["supported"],
+        false
+    );
+    assert_eq!(models[1]["id"], "qwen3");
+    assert_eq!(models[1]["max_input_tokens"], 0);
+    assert_eq!(
+        models[1]["capabilities"]["thinking"]["supported"], true,
+        "per-profile capabilities override merges into the default advertisement: {models:?}"
+    );
+    assert_eq!(models[1]["capabilities"]["image_input"]["supported"], false);
+
+    // limit=1: pagination still truncates the synthesized (not proxied) list.
     let response = app
         .oneshot(
             Request::builder()
@@ -2641,30 +2682,13 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         )
         .await
         .expect("response");
-
     assert_eq!(response.status().as_u16(), 200);
-    assert!(response.headers().get("etag").is_none());
     let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
     assert_eq!(body["has_more"], true);
-    assert_eq!(body["first_id"], "glm-5.1");
-    assert_eq!(body["last_id"], "glm-5.1");
-    let models = body["data"].as_array().expect("data array");
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0]["id"], "glm-5.1");
-    assert_eq!(models[0]["type"], "model");
-    assert_eq!(models[0]["display_name"], "glm-5.1");
-    assert_eq!(models[0]["created_at"], "2025-10-09T08:53:20Z");
-    assert_eq!(models[0]["max_input_tokens"], 131072);
-    assert_eq!(models[0]["max_tokens"], 8192);
-    assert_eq!(models[0]["capabilities"]["thinking"]["supported"], false);
-    assert_eq!(models[0]["capabilities"]["image_input"]["supported"], false);
-    assert_eq!(
-        models[0]["capabilities"]["structured_outputs"]["supported"],
-        false
-    );
+    assert_eq!(body["data"].as_array().expect("data array").len(), 1);
 }
 
 #[tokio::test]
@@ -2683,7 +2707,13 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         .await;
 
     let mut config = test_config();
-    route_all_to(&mut config, &server.uri());
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\nmodel_profiles:\n  model-a:\n    upstream: primary\n  model-b:\n    upstream: primary\n  model-c:\n    upstream: primary\n",
+            server.uri()
+        ),
+    );
     let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
@@ -2711,6 +2741,46 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         .map(|model| model["id"].as_str().expect("model id"))
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["model-b", "model-c"]);
+}
+
+#[tokio::test]
+async fn models_endpoint_lists_profiles_when_upstream_catalog_is_unreachable() {
+    let server = MockServer::start().await;
+    // No `/v1/models` mock mounted: the catalog fetch behind `context_length`
+    // fails, which must stay non-fatal for the synthesized profile list.
+
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\nmodel_profiles:\n  glm-5.1:\n    upstream: primary\n",
+            server.uri()
+        ),
+    );
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(
+        body,
+        json!({
+            "object": "list",
+            "data": [{"id": "glm-5.1", "object": "model", "owned_by": "llmconduit"}]
+        }),
+        "a catalog-load failure never fails the profile list, it just omits context_length: {body}"
+    );
 }
 
 #[tokio::test]

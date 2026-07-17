@@ -68,6 +68,14 @@ fn instant_deadline_to_epoch_ms(deadline: Option<Instant>) -> Option<u64> {
     Some(now_epoch_ms().saturating_add(remaining.as_millis() as u64))
 }
 
+/// Convert a PAST monotonic `Instant` (e.g. a catalog fetch time) to an
+/// epoch-ms wall-clock value, by measuring how long ago it was and subtracting
+/// that from the current epoch-ms.
+fn past_instant_to_epoch_ms(instant: Instant) -> u64 {
+    let elapsed = Instant::now().saturating_duration_since(instant);
+    now_epoch_ms().saturating_sub(elapsed.as_millis() as u64)
+}
+
 /// Wall-clock epoch-ms as `u128`, matching the dashboard FlowStore's `started_ms`/phase
 /// stamps (gap 03 attempt timestamps). A clock that is before `UNIX_EPOCH` yields `0`.
 fn now_epoch_ms_u128() -> u128 {
@@ -2148,13 +2156,6 @@ impl ProfileRoutingClient {
             .collect()
     }
 
-    fn first_provider(&self) -> AppResult<&FailoverUpstreamProvider> {
-        self.failover
-            .providers
-            .first()
-            .ok_or_else(|| AppError::internal("profile routing client has no configured upstreams"))
-    }
-
     async fn load_catalog(&self) -> AppResult<ProfileModelCatalog> {
         let mut cache = self.catalog.lock().await;
         if let Some(cached) = cache.as_ref()
@@ -2252,9 +2253,13 @@ impl UpstreamClient for ProfileRoutingClient {
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
-        // Placeholder: proxy the first configured upstream's listing until the
-        // profile-derived `/v1/models` is built.
-        self.first_provider()?.client.list_models().await
+        // No caller: `/v1/models` is synthesized from the configured profiles
+        // and `supported_model_catalog` covers per-model context limits, so
+        // there is no single upstream response this method could honestly
+        // return. Kept only because the trait requires an implementation.
+        Err(AppError::internal(
+            "list_models is not supported on the profile routing client; use supported_model_catalog",
+        ))
     }
 
     async fn proxy_completions(
@@ -2303,10 +2308,23 @@ impl UpstreamClient for ProfileRoutingClient {
     }
 
     /// Each named upstream reported as its own provider (no routing wrapper, so
-    /// no `route` stamp and no per-chain catalog meta).
+    /// no `route` stamp). Catalog metadata comes from whatever the shared
+    /// TTL cache last loaded (via `/v1/models` or a routed request) - a
+    /// `try_lock` so this stays synchronous and lock-free like the rest of
+    /// `provider_health`; the rare contended case just reports unfetched.
     fn provider_health(&self) -> Vec<ProviderHealth> {
-        self.failover
-            .provider_health_with_route(None, CatalogMeta::default())
+        let catalog_meta = self
+            .catalog
+            .try_lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|cached| CatalogMeta {
+                    fetched_ms: Some(past_instant_to_epoch_ms(cached.fetched_at)),
+                    size: Some(cached.catalog.union.len() as u64),
+                })
+            })
+            .unwrap_or_default();
+        self.failover.provider_health_with_route(None, catalog_meta)
     }
 }
 
