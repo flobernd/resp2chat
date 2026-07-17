@@ -1366,7 +1366,7 @@ impl Gateway {
         }
 
         let (baseline_record, prefix_len) = self
-            .find_replay_baseline(&request)
+            .find_replay_baseline(&request, &served_model)
             .await
             .map_err(&finalize_pre_spawn_err)?;
         let mut tail_request = request.clone();
@@ -1698,16 +1698,22 @@ impl Gateway {
         })
     }
 
+    // Keyed by the served-model LABEL, not `request.model`: the insert side
+    // (`run_turn`, below) hashes on `served_model` too, since that's the stable
+    // identity across a profile's `upstream_model` remap. Hashing the lookup on
+    // the raw request model would never agree with the insert for any profile
+    // whose `upstream_model` differs from its key.
     async fn find_replay_baseline(
         &self,
         request: &ResponsesRequest,
+        served_model: &str,
     ) -> AppResult<(Option<ReplayRecord>, usize)> {
         if !request.store {
             return Ok((None, 0));
         }
         let record = self
             .replay_store
-            .longest_prefix_match(&request.model, &request.instructions, &request.input)
+            .longest_prefix_match(served_model, &request.instructions, &request.input)
             .await;
         if let Some(record) = record {
             let prefix_len = record.visible_history.len();

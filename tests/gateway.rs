@@ -862,6 +862,92 @@ async fn replays_reasoning_into_follow_up_request() {
 }
 
 #[tokio::test]
+async fn replays_web_search_result_for_profile_with_upstream_model() {
+    // Issue #32: the replay lookup hashed on `request.model` (the client-facing
+    // profile key) while the insert hashes on `served_model` (the profile's
+    // resolved `upstream_model`). Mirrors
+    // `hides_web_search_loop_but_replays_internal_tool_result` above, but
+    // through a profile whose `upstream_model` differs from its key: a
+    // mismatched hash key means the follow-up turn never finds the first
+    // turn's baseline, so the actual search result degrades to the "replay
+    // state was missing" placeholder instead of being replayed.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_ws_1",
+            "web_search",
+            "{\"query\":\"weather seattle\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "It is rainy."))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-3", "Follow up done."))])
+        .await;
+    let search = MockSearch::default();
+
+    let mut config = test_config();
+    config.model_profiles = vec![llmconduit::config::CompiledProfile {
+        key: "aliased-model".to_string(),
+        glob: None,
+        profile: llmconduit::config::ModelProfile {
+            upstream_model: Some("backend-model".to_string()),
+            ..Default::default()
+        },
+    }];
+    let gateway = test_gateway_with_config(upstream.clone(), search.clone(), config);
+
+    let mut first_request = base_request(vec![user_message("weather?")]);
+    first_request.model = "aliased-model".to_string();
+    first_request.store = true;
+    first_request.tools = vec![ToolSpec::WebSearch {
+        external_web_access: Some(true),
+        filters: None,
+        user_location: None,
+        search_context_size: None,
+        search_content_types: None,
+    }];
+    let first_events = collect_stream(
+        gateway
+            .clone()
+            .stream_responses(first_request.clone())
+            .await
+            .expect("first stream"),
+    )
+    .await;
+
+    let mut second_input = first_request.input;
+    second_input.extend(done_items(&first_events));
+    second_input.push(user_message("why?"));
+    let mut second_request = base_request(second_input);
+    second_request.model = "aliased-model".to_string();
+    second_request.store = true;
+
+    let _ = collect_stream(
+        gateway
+            .stream_responses(second_request)
+            .await
+            .expect("second stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].messages.len(), 5);
+    assert_eq!(requests[2].messages[2].role, "tool");
+    assert_eq!(
+        requests[2].messages[2]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("Search result for weather seattle"),
+        "the replayed baseline must be found via the served model, not the profile alias"
+    );
+}
+
+#[tokio::test]
 async fn forwards_configured_upstream_chat_kwargs() {
     let upstream = MockUpstream::default();
     upstream
