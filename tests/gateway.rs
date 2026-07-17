@@ -116,10 +116,6 @@ impl MockUpstream {
         *self.context_limits.lock().await =
             limits.into_iter().map(|(id, n)| (id.into(), n)).collect();
     }
-
-    async fn supported_model_queries(&self) -> usize {
-        *self.supported_model_queries.lock().await
-    }
 }
 
 #[async_trait]
@@ -640,90 +636,6 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
 }
 
 #[tokio::test]
-async fn normalizes_model_name_from_upstream_catalog() {
-    let upstream = MockUpstream::default();
-    upstream.set_supported_models(["Qwen3.5"]).await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
-        .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
-
-    let mut request = base_request(vec![user_message("hello")]);
-    request.model = "some-client-alias".to_string();
-
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].model, "Qwen3.5");
-}
-
-#[tokio::test]
-async fn reuses_cached_upstream_model_catalog_across_requests() {
-    let upstream = MockUpstream::default();
-    upstream.set_supported_models(["glm-5.1"]).await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "first"))])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "second"))])
-        .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
-
-    let mut first = base_request(vec![user_message("hello")]);
-    first.model = "GLM-5.1".to_string();
-    let _ = collect_stream(
-        gateway
-            .clone()
-            .stream_responses(first)
-            .await
-            .expect("first stream"),
-    )
-    .await;
-
-    let mut second = base_request(vec![user_message("hello again")]);
-    second.model = "GLM 5 1".to_string();
-    let _ = collect_stream(
-        gateway
-            .stream_responses(second)
-            .await
-            .expect("second stream"),
-    )
-    .await;
-
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].model, "glm-5.1");
-    assert_eq!(requests[1].model, "glm-5.1");
-    assert_eq!(upstream.supported_model_queries().await, 1);
-}
-
-#[tokio::test]
-async fn ambiguous_catalog_match_defaults_to_first_backend_model() {
-    let upstream = MockUpstream::default();
-    upstream.set_supported_models(["foo-1", "foo1"]).await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
-        .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
-
-    let mut request = base_request(vec![user_message("hello")]);
-    request.model = "FOO 1".to_string();
-
-    let _ = collect_stream(
-        gateway
-            .stream_responses(request.clone())
-            .await
-            .expect("stream"),
-    )
-    .await;
-
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].model, "foo-1");
-}
-
-#[tokio::test]
 async fn returns_final_usage_on_response_completed() {
     let upstream = MockUpstream::default();
     upstream
@@ -970,7 +882,11 @@ async fn forwards_configured_upstream_chat_kwargs() {
             )]),
             upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
-            model_profiles: Vec::new(),
+            model_profiles: vec![llmconduit::config::CompiledProfile {
+                key: "*".to_string(),
+                glob: llmconduit::config::compile_model_glob("*").expect("catch-all glob"),
+                profile: llmconduit::config::ModelProfile::default(),
+            }],
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
@@ -6608,7 +6524,15 @@ fn test_config() -> Config {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: Vec::new(),
+        // A `"*"` catch-all so a bare request model resolves to a pass-through
+        // route (served model = request model): the `MockUpstream`-backed gateway
+        // tests inject their own upstream client, so the router is bypassed, but
+        // the engine still resolves the served-model label through the profiles.
+        model_profiles: vec![llmconduit::config::CompiledProfile {
+            key: "*".to_string(),
+            glob: llmconduit::config::compile_model_glob("*").expect("catch-all glob"),
+            profile: llmconduit::config::ModelProfile::default(),
+        }],
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),
@@ -7134,6 +7058,434 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
             "request-alias profile kwargs must not apply to a failover target (T1)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Engine resolution semantics: the router is the single resolution point. The
+// engine resolves a request model to a served-model LABEL for its own needs but
+// dispatches the ORIGINAL request model, so `ProfileRoutingClient` resolves the
+// failover chain exactly once and each chain step supplies the POSTed model. An
+// unserved model surfaces a clean 404 before any upstream call; a blank model
+// with no glob to resolve it is a 400.
+// ---------------------------------------------------------------------------
+
+/// A minimal successful chat-completions SSE 200 that echoes one content chunk,
+/// mounted on `server` for every POST to `/v1/chat/completions`.
+async fn mount_chat_completions_ok(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{ "index": 0, "delta": { "content": "ok" }, "finish_reason": null }],
+                    "usage": null
+                })])),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The POSTed `model` of every recorded `/v1/chat/completions` request on `server`.
+async fn posted_chat_models(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
+        })
+        .map(|request| {
+            let body: serde_json::Value = request.body_json().expect("chat request json");
+            body["model"].as_str().expect("model field").to_string()
+        })
+        .collect()
+}
+
+/// Regression: a non-catch-all profile whose key is NOT itself a served id (it
+/// remaps via `upstream_model`) used to 404 end-to-end. The engine pre-resolved
+/// the dispatched model to the remap target, then the router re-resolved that
+/// already-resolved id and found no matching profile. With the router as the
+/// single resolution point the backend request keeps the request alias and the
+/// chain step supplies the rewritten POSTed model.
+#[tokio::test]
+async fn profile_upstream_model_routes_through_build_app_and_posts_rewritten_id() {
+    let server = MockServer::start().await;
+    mount_chat_completions_ok(&server).await;
+
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            concat!(
+                "upstreams:\n",
+                "  - name: primary\n",
+                "    url: \"{}/v1/\"\n",
+                "model_profiles:\n",
+                "  alias-model:\n",
+                "    upstream: primary\n",
+                "    upstream_model: real-model\n",
+            ),
+            server.uri()
+        ),
+    );
+    let app = llmconduit::build_app(config);
+
+    let request_body = json!({
+        "model": "alias-model",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        posted_chat_models(&server).await,
+        vec!["real-model".to_string()],
+        "the router rewrites the POSTed model to the profile's upstream_model"
+    );
+}
+
+/// The engine's own streaming entry point rejects an unserved model pre-dispatch
+/// (the HTTP fronts resolve the label one layer up, so this covers the engine
+/// path directly): a non-blank unserved model is a 404, a blank one a 400.
+#[tokio::test]
+async fn engine_stream_responses_rejects_unserved_and_blank_models() {
+    let upstream = MockUpstream::default();
+    let mut config = test_config();
+    // Exact-only profile, no catch-all: nothing else resolves.
+    config.model_profiles = vec![llmconduit::config::CompiledProfile {
+        key: "known-model".to_string(),
+        glob: None,
+        profile: llmconduit::config::ModelProfile::default(),
+    }];
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let mut unknown = base_request(vec![user_message("hi")]);
+    unknown.model = "unknown-model".to_string();
+    let unknown_err = gateway
+        .clone()
+        .stream_responses(unknown)
+        .await
+        .expect_err("unserved model must not dispatch");
+    assert_eq!(unknown_err.status_code(), axum::http::StatusCode::NOT_FOUND);
+
+    let mut blank = base_request(vec![user_message("hi")]);
+    blank.model = "   ".to_string();
+    let blank_err = gateway
+        .stream_responses(blank)
+        .await
+        .expect_err("blank model must not dispatch");
+    assert_eq!(blank_err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+
+    assert!(
+        upstream.requests().await.is_empty(),
+        "no upstream request is issued for a rejected model"
+    );
+}
+
+/// An unserved model returns a 404 error envelope BEFORE any upstream call, on
+/// all three inbound fronts (chat completions, responses, anthropic messages).
+#[tokio::test]
+async fn unknown_model_returns_404_envelope_on_all_fronts() {
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        concat!(
+            "upstreams:\n",
+            "  - name: primary\n",
+            // Never contacted: the 404 fires pre-dispatch.
+            "    url: \"http://127.0.0.1:9/v1/\"\n",
+            "model_profiles:\n",
+            "  known-model:\n",
+            "    upstream: primary\n",
+        ),
+    );
+    let app = llmconduit::build_app(config);
+
+    // Chat completions front (OpenAI-style envelope).
+    let chat = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "unknown-model",
+                        "stream": false,
+                        "messages": [{ "role": "user", "content": "Hi" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(chat.status().as_u16(), 404);
+    let chat_body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(chat.into_body(), 4096).await.unwrap())
+            .expect("chat error json");
+    assert!(
+        chat_body["error"]["message"].as_str().is_some_and(
+            |message| message.contains("is not served by any configured model profile")
+        ),
+        "chat 404 envelope: {chat_body}"
+    );
+
+    // Responses front (OpenAI-style envelope).
+    let responses = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "unknown-model",
+                        "stream": false,
+                        "input": [{
+                            "type": "message",
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": "Hi" }]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(responses.status().as_u16(), 404);
+    let responses_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(responses.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .expect("responses error json");
+    assert!(
+        responses_body["error"]["message"].as_str().is_some_and(
+            |message| message.contains("is not served by any configured model profile")
+        ),
+        "responses 404 envelope: {responses_body}"
+    );
+
+    // Anthropic messages front (Anthropic-style envelope).
+    let messages = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "unknown-model",
+                        "max_tokens": 16,
+                        "stream": false,
+                        "messages": [{ "role": "user", "content": "Hi" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(messages.status().as_u16(), 404);
+    let messages_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(messages.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .expect("messages error json");
+    assert_eq!(messages_body["error"]["type"], "not_found_error");
+}
+
+/// A blank model on a config whose only profile is a `"*"` glob WITHOUT
+/// `upstream_model` has nothing to resolve to, so it is a 400.
+#[tokio::test]
+async fn blank_model_without_glob_upstream_model_is_bad_request() {
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        concat!(
+            "upstreams:\n",
+            "  - name: primary\n",
+            "    url: \"http://127.0.0.1:9/v1/\"\n",
+            "model_profiles:\n",
+            "  \"*\":\n",
+            "    upstream: primary\n",
+        ),
+    );
+    let app = llmconduit::build_app(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "",
+                        "stream": false,
+                        "messages": [{ "role": "user", "content": "Hi" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 400);
+}
+
+/// A blank model resolves when the `"*"` glob pins its own `upstream_model`: that
+/// id is what the router POSTs.
+#[tokio::test]
+async fn blank_model_with_glob_upstream_model_resolves_and_posts_it() {
+    let server = MockServer::start().await;
+    mount_chat_completions_ok(&server).await;
+
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            concat!(
+                "upstreams:\n",
+                "  - name: primary\n",
+                "    url: \"{}/v1/\"\n",
+                "model_profiles:\n",
+                "  \"*\":\n",
+                "    upstream: primary\n",
+                "    upstream_model: default-model\n",
+            ),
+            server.uri()
+        ),
+    );
+    let app = llmconduit::build_app(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "",
+                        "stream": false,
+                        "messages": [{ "role": "user", "content": "Hi" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        posted_chat_models(&server).await,
+        vec!["default-model".to_string()],
+        "a blank model serves the glob profile's pinned upstream_model"
+    );
+}
+
+/// The served-model label in the response body is the profile KEY for an exact
+/// profile and the REQUEST model for a glob profile (both without `upstream_model`).
+#[tokio::test]
+async fn served_model_label_is_profile_key_for_exact_and_request_model_for_glob() {
+    let server = MockServer::start().await;
+    mount_chat_completions_ok(&server).await;
+
+    let mut config = test_config();
+    apply_routing_yaml(
+        &mut config,
+        &format!(
+            concat!(
+                "upstreams:\n",
+                "  - name: primary\n",
+                "    url: \"{}/v1/\"\n",
+                "model_profiles:\n",
+                "  exact-model:\n",
+                "    upstream: primary\n",
+                "  \"glob-*\":\n",
+                "    upstream: primary\n",
+            ),
+            server.uri()
+        ),
+    );
+    let app = llmconduit::build_app(config);
+
+    let exact = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "exact-model",
+                        "stream": false,
+                        "messages": [{ "role": "user", "content": "Hi" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(exact.status().as_u16(), 200);
+    let exact_body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(exact.into_body(), 4096).await.unwrap())
+            .expect("exact body json");
+    assert_eq!(
+        exact_body["model"].as_str(),
+        Some("exact-model"),
+        "an exact profile labels the response with the profile key"
+    );
+
+    let glob = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "glob-abc",
+                        "stream": false,
+                        "messages": [{ "role": "user", "content": "Hi" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(glob.status().as_u16(), 200);
+    let glob_body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(glob.into_body(), 4096).await.unwrap())
+            .expect("glob body json");
+    assert_eq!(
+        glob_body["model"].as_str(),
+        Some("glob-abc"),
+        "a glob profile labels the response with the request model"
+    );
 }
 
 #[tokio::test]
@@ -9103,7 +9455,11 @@ async fn cancels_mid_stream_when_client_disconnects() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: Vec::new(),
+        model_profiles: vec![llmconduit::config::CompiledProfile {
+            key: "*".to_string(),
+            glob: llmconduit::config::compile_model_glob("*").expect("catch-all glob"),
+            profile: llmconduit::config::ModelProfile::default(),
+        }],
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: None,

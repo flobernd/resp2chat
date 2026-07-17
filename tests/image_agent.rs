@@ -43,7 +43,6 @@ use llmconduit::models::responses::ToolSpec;
 use llmconduit::replay::ReplayRecord;
 use llmconduit::replay::ReplayStore;
 use pretty_assertions::assert_eq;
-use serde_json::Map as JsonMap;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -1380,53 +1379,6 @@ async fn image_agent_redacts_data_url_in_successful_vision_text() {
     let serialized = serde_json::to_string(&requests[1]).expect("serialize");
     assert!(!serialized.contains("LEAKEDB64"));
     assert!(!serialized.contains("LEAKEDSIG"));
-}
-
-#[tokio::test]
-async fn image_agent_strips_when_kimi_alias_remaps_to_text_backend() {
-    // Round-4 #1: gating must enumerate candidates from the RESOLVED model the
-    // upstream actually receives, not the raw request model. A Kimi-LOOKING
-    // request alias whose profile `upstream_model` remaps to a TEXT backend must
-    // STRIP (the old code judged "kimi-alias" by name and wrongly passed raw
-    // images to the text backend). MockUpstream's candidate_backend_models
-    // echoes the model it is given, so the resolved model drives the decision.
-    let upstream = MockUpstream::default();
-    upstream.set_supported_models(["deepseek-v3"]).await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
-        .await;
-    let mut config = image_agent_config();
-    // Profile on the request alias remaps to a text backend via upstream_model.
-    config.model_profiles = vec![llmconduit::config::CompiledProfile {
-        key: "kimi-fast".to_string(),
-        glob: None,
-        profile: llmconduit::config::ModelProfile {
-            upstream_model: Some("deepseek-v3".to_string()),
-            system_prompt_prefix: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            ..Default::default()
-        },
-    }];
-    let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.model = "kimi-fast".to_string();
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    // The upstream request must carry the text backend model and NO raw image.
-    assert_eq!(requests[0].model, "deepseek-v3");
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(
-        !serialized.contains("iVBORw0KGgo"),
-        "a kimi-alias remapped to a text backend must strip, not pass raw images"
-    );
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(
-        has_analyze,
-        "remap-to-text-backend must inject analyzeImage"
-    );
 }
 
 #[tokio::test]

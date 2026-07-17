@@ -2014,8 +2014,8 @@ pub(crate) fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
 
 /// Compile a persisted key into a case-insensitive glob matcher, or `None` for
 /// a literal key matched by exact (trimmed, case-insensitive) comparison
-/// instead. Shared glob-compilation entry point for both `model_routes` and
-/// `model_profiles`, so both keep exactly one glob truth.
+/// instead. The single glob-compilation entry point for `model_profiles`, so
+/// profile keys keep exactly one glob truth.
 pub fn compile_model_glob(pattern: &str) -> Result<Option<Regex>, String> {
     if is_glob_pattern(pattern) {
         Ok(Some(glob_to_regex(pattern)?))

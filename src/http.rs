@@ -1304,7 +1304,7 @@ async fn post_responses(
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let served = gateway.resolve_request_model(&request.model).await.0;
+    let served = gateway.resolve_request_model(&request.model)?;
     let wants_stream = request.stream;
     let stream = gateway
         .stream_responses_with_api_call_id(request, api_call_id.map(|extension| extension.0.0))
@@ -1356,7 +1356,10 @@ async fn handle_count_tokens(
 
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
-    let resolved_model = gateway.resolve_request_model(&original_model).await.0;
+    // Reject an unserved model up front (404 / 400) with the router's semantics,
+    // then dispatch the ORIGINAL request model so the router resolves the chain
+    // exactly once (the single resolution point).
+    gateway.resolve_request_model(&original_model)?;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request);
     let roles = gateway.config().resolve_roles_config(&original_model);
     let lowered = responses_to_chat::lower_request_with_image_agent_and_roles(
@@ -1373,7 +1376,7 @@ async fn handle_count_tokens(
     let thinking_override = responses_request.thinking;
     let backend = BackendChatRequest::new(
         ChatCompletionRequest {
-            model: resolved_model,
+            model: original_model.trim().to_string(),
             messages: lowered.messages,
             stream: false,
             tools: (!lowered.tools.is_empty()).then_some(lowered.tools),
@@ -1418,7 +1421,7 @@ async fn post_chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let model = gateway.resolve_request_model(&request.model).await.0;
+    let model = gateway.resolve_request_model(&request.model)?;
     let wants_stream = request.stream;
     let include_usage = request
         .stream_options
@@ -1463,7 +1466,7 @@ async fn handle_post_messages(
     api_call_id: Option<String>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let model = gateway.resolve_request_model(&request.model).await.0;
+    let model = gateway.resolve_request_model(&request.model)?;
     let wants_stream = request.stream;
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let stream = gateway

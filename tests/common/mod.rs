@@ -491,7 +491,15 @@ pub fn test_config() -> Config {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: Vec::new(),
+        // A `"*"` catch-all so a bare request model resolves to a pass-through
+        // route (served model = request model). Tests that inject their own
+        // upstream client bypass the router, but the engine still resolves the
+        // served-model label through the profiles.
+        model_profiles: vec![llmconduit::config::CompiledProfile {
+            key: "*".to_string(),
+            glob: llmconduit::config::compile_model_glob("*").expect("catch-all glob"),
+            profile: llmconduit::config::ModelProfile::default(),
+        }],
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),

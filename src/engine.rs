@@ -49,7 +49,6 @@ use crate::upstream::ProviderHealth;
 use crate::upstream::ProviderHealthPublisher;
 use crate::upstream::UpstreamClient;
 use crate::upstream::UpstreamModelEntry;
-use crate::upstream::canonical_model_key;
 use crate::upstream::sanitize_chat_request;
 use crate::vision::ImageCache;
 use crate::vision::VisionClient;
@@ -182,13 +181,6 @@ pub struct Gateway {
     /// zero overhead. Cloning the Gateway shares the inner `Arc`, keeping the derived
     /// `Clone`.
     abort_hub: crate::dashboard_flow::AbortHub,
-    /// Throttle state for the "requested model not served → fell back to the
-    /// default catalog model" WARN. Every request resolves the model TWICE (the
-    /// HTTP layer to label the response, then the engine to drive the upstream
-    /// call), so without throttling a persistent mismatch logs the same WARN
-    /// twice per request forever. Keyed by requested model; fires once per
-    /// catalog-TTL window, mirroring claude-relay's once-per-detection logging.
-    model_fallback_warned: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
     /// E1: always-on (NOT dashboard-gated) bounded counter for hallucinated
     /// unoffered tool calls, keyed `{provider, served_model, outcome}`. The
     /// incident this guards was INVISIBLE in production logs, so unlike the
@@ -196,7 +188,7 @@ pub struct Gateway {
     /// this aggregate is always live; the `tracing::warn!` at the reject site is
     /// the primary operator signal and this is the bounded count. Raw tool names
     /// are NEVER labels (cardinality). `Arc<Mutex<..>>` so a cloned `Gateway`
-    /// shares one count, mirroring `model_fallback_warned`.
+    /// shares one count.
     unknown_tool_call_counts: Arc<std::sync::Mutex<BTreeMap<UnknownToolCounterKey, u64>>>,
     /// Process-wide negative capability cache for the optional backend
     /// `/tokenize` endpoint. The routing implementation probes all eligible
@@ -218,76 +210,29 @@ struct CachedUpstreamModelCatalog {
 
 #[derive(Clone, Default)]
 struct UpstreamModelCatalog {
-    ids: Vec<String>,
-    ids_by_key: HashMap<String, Vec<String>>,
     /// Per-model context-window length (keyed by upstream catalog id) parsed
     /// from `/v1/models`. T9 moved ROUTING-mode budgeting to the routing
     /// layer's `BackendCandidatePlan` (conservative MIN over per-provider
-    /// limits); this engine catalog is the NON-ROUTING resolver (the single
-    /// provider's catalog, which IS the served model's limit) and the fallback
-    /// when the candidate plan has no known limits (all-unknown / catalog-load
-    /// failure). `normalize_upstream_model`'s ladder uses only the id fields.
+    /// limits); this engine catalog is the NON-ROUTING budgeting fallback (the
+    /// single provider's catalog, which IS the served model's limit) used when
+    /// the candidate plan has no known limits (all-unknown / catalog-load
+    /// failure).
     context_limit_by_id: HashMap<String, i64>,
 }
 
 impl UpstreamModelCatalog {
-    /// Build the catalog from a single `/v1/models` snapshot: the id list,
-    /// `canonical_model_key` index, and per-model context limit all derive from
-    /// the same entries, so normalization and (non-routing) budgeting describe
-    /// one consistent provider state.
+    /// Build the catalog from a single `/v1/models` snapshot: only the per-model
+    /// context limits, for the non-routing G3 budgeting fallback.
     fn from_entries(entries: Vec<UpstreamModelEntry>) -> Self {
-        let mut ids = Vec::with_capacity(entries.len());
-        let mut ids_by_key: HashMap<String, Vec<String>> = HashMap::new();
         let mut context_limit_by_id: HashMap<String, i64> = HashMap::new();
         for entry in entries {
-            let key = canonical_model_key(&entry.id);
-            if !key.is_empty() {
-                ids_by_key.entry(key).or_default().push(entry.id.clone());
-            }
             if let Some(limit) = entry.context_limit {
-                context_limit_by_id.insert(entry.id.clone(), limit);
+                context_limit_by_id.insert(entry.id, limit);
             }
-            ids.push(entry.id);
         }
         Self {
-            ids,
-            ids_by_key,
             context_limit_by_id,
         }
-    }
-
-    /// Exact catalog id match (highest precedence). `None` when the model is
-    /// blank or not an exact id.
-    fn exact_id(&self, model: &str) -> Option<String> {
-        let trimmed = model.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        self.ids.iter().find(|id| id.as_str() == trimmed).cloned()
-    }
-
-    /// Unique canonical-key match (`canonical_model_key`). `None` when blank,
-    /// unmatched, or ambiguous (maps to more than one id).
-    fn canonical_unique(&self, model: &str) -> Option<String> {
-        let trimmed = model.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let key = canonical_model_key(trimmed);
-        let matches = self.ids_by_key.get(&key)?;
-        let unique_ids = matches
-            .iter()
-            .map(String::as_str)
-            .collect::<std::collections::HashSet<_>>();
-        (unique_ids.len() == 1)
-            .then(|| matches.first().cloned())
-            .flatten()
-    }
-
-    /// Default catalog id: first model of the catalog (blank/missing/ambiguous
-    /// fallback). `None` only when the catalog is empty.
-    fn default_id(&self) -> Option<String> {
-        self.ids.first().cloned()
     }
 }
 
@@ -741,7 +686,6 @@ impl Gateway {
             // enabled sink via `with_turn_capture` when `turn_capture_dir` is
             // configured -- independent of `--with-debug-ui`.
             turn_capture: crate::turn_capture::TurnCapture::disabled(),
-            model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
         }
@@ -1012,17 +956,26 @@ impl Gateway {
         })
     }
 
-    /// Resolve `request_model` to the served upstream model and whether the
-    /// resolution was GENUINE (the request truly maps to the served backend, not
-    /// a catalog-default fallback). `genuine` is a byproduct of the one
-    /// normalization ladder — NOT a re-derived side-channel (T2 deleted
-    /// `request_model_genuinely_resolves`, which walked the ladder a second
-    /// time). G4 native-vision gating consumes it so a request-model
-    /// `native_vision` override attaches ONLY when the request genuinely maps to
-    /// the served backend (G4 round-8 #1).
-    pub async fn resolve_request_model(&self, request_model: &str) -> (String, bool) {
-        let configured_model = self.config.resolve_upstream_model(request_model);
-        self.normalize_upstream_model(&configured_model).await
+    /// Resolve `request_model` to the served-model LABEL via the profile router
+    /// (`Config::resolve_route`), the single resolution point. Consumers that need
+    /// a served identity read this label: the response `model`, the price-table +
+    /// response-header keys, capture metadata, and the non-routing budgeting
+    /// fallback. The DISPATCHED backend request keeps the ORIGINAL request model,
+    /// so `ProfileRoutingClient` resolves the failover chain exactly once with
+    /// each chain step supplying the per-provider POSTed model.
+    ///
+    /// A non-blank model that matches no profile is a 404. A blank model that
+    /// matches no glob has nothing to resolve to, so it is a 400.
+    pub fn resolve_request_model(&self, request_model: &str) -> AppResult<String> {
+        match self.config.resolve_route(request_model) {
+            Some(route) => Ok(route.served_model),
+            None if request_model.trim().is_empty() => Err(AppError::bad_request(
+                "no model specified and no model profile serves a blank model",
+            )),
+            None => Err(AppError::not_found(format!(
+                "model {request_model:?} is not served by any configured model profile"
+            ))),
+        }
     }
 
     /// Decide whether the Chat output converter must suppress
@@ -1209,6 +1162,14 @@ impl Gateway {
         request: ResponsesRequest,
         api_call_id: Option<String>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
+        // Single resolution point: resolve the served-model LABEL here (404 for an
+        // unserved model, 400 for a blank one) BEFORE claiming any flow guard or
+        // contacting an upstream. The DISPATCHED backend model stays the original
+        // request model, which `ProfileRoutingClient` resolves exactly once.
+        let served_model = self.resolve_request_model(&request.model)?;
+        // The backend request the router resolves keeps the ORIGINAL (trimmed)
+        // request model; the chain steps supply the per-provider POSTed model.
+        let dispatch_model = request.model.trim().to_string();
         // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
         // telemetry guard built BELOW and every per-turn `BackendChatRequest` in
         // `run_turn` share the SAME `Arc` — the failover/routing layers tag
@@ -1261,11 +1222,10 @@ impl Gateway {
         // model the leaf records as `model_served`. Stamped onto the record via
         // `set_normalized` below alongside the normalized canonical body.
         let model_requested = request.model.clone();
-        let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
         // F1c: stamp the resolved/served model onto the capture outcome metadata now
         // that resolution has settled (absent for a turn that fails before here).
         if let Some(guard) = &capture_guard {
-            guard.set_model_served(&resolved_model);
+            guard.set_model_served(&served_model);
         }
         let mut request = self.apply_system_prompt_prefix(request);
 
@@ -1283,8 +1243,11 @@ impl Gateway {
         // raw images. Must be computed unconditionally (not just when G4's own
         // earlier gates pass) because E2b runs regardless of whether the G4
         // agent activated.
+        // Reaching here means the model resolved to a route (an unserved model
+        // 404s pre-dispatch above), so the request genuinely maps to its served
+        // backend; the candidate set is enumerated from the dispatched model.
         let native_vision = self
-            .backend_is_native_vision(&request.model, &resolved_model, request_genuine)
+            .backend_is_native_vision(&request.model, &dispatch_model, true)
             .await;
 
         // G4 image-agent strip/cache seam. This runs AFTER model/profile
@@ -1362,7 +1325,7 @@ impl Gateway {
                 // there needs a metadata wrapper, out of scope here.
                 tracing::warn!(
                     count = degraded_images,
-                    model = %resolved_model,
+                    model = %served_model,
                     "residual image(s) degraded to text placeholders for a non-vision backend"
                 );
                 self.monitor
@@ -1458,15 +1421,15 @@ impl Gateway {
         // window (`None`) are skipped (unknown ⇒ no-op, matching pre-T9). If NO
         // candidate reports a window (non-routing single upstream / all-unknown
         // / empty set), fall back to the engine's non-routing catalog limit for
-        // `resolved_model` (the single provider's window — the served model's
-        // limit, correct in non-routing mode). If that is also unknown,
+        // the served model (the single provider's window, correct in non-routing
+        // mode). If that is also unknown,
         // budgeting no-ops. Cap an explicitly requested `max_output_tokens` down
         // to what still fits after the estimated input + fixed margin. If the
         // byte heuristic says no budget remains, defer instead of rejecting:
         // only the provider tokenizer can decide true overflow. We mutate ONLY
         // the typed field, which flows through to the chat request build and
         // wins over conflicting default max-token aliases.
-        let candidate_plan = self.upstream.backend_candidate_plan(&resolved_model).await;
+        let candidate_plan = self.upstream.backend_candidate_plan(&dispatch_model).await;
         // T9: the candidate plan is the authoritative resolver in routing/
         // failover mode. The engine's own `/v1/models` catalog is a budgeting
         // fallback ONLY in plain single-provider mode (where it IS the single
@@ -1476,7 +1439,7 @@ impl Gateway {
         // against the wrong window.
         let mut limit = candidate_context_floor(&candidate_plan);
         if limit.is_none() && self.config.is_plain_single_provider() {
-            limit = self.upstream_model_context_limit(&resolved_model).await;
+            limit = self.upstream_model_context_limit(&served_model).await;
         }
         // C3: compute the estimate UNCONDITIONALLY now, not only when a context
         // `limit` is known -- it also rides the `response.created` SSE event
@@ -1506,7 +1469,7 @@ impl Gateway {
         // (not per streamed chunk) -- accepted rather than churned for a LOW
         // finding.
         let estimated_input_tokens =
-            estimate_input_tokens(&lowered, self.config.flatten_content, &resolved_model);
+            estimate_input_tokens(&lowered, self.config.flatten_content, &served_model);
         if let Some(limit) = limit {
             match budget_explicit_max_output_tokens(
                 request.max_output_tokens,
@@ -1520,7 +1483,7 @@ impl Gateway {
                     // let the provider's tokenizer decide, then use the exact
                     // context-overflow shrink-and-retry path if necessary.
                     tracing::debug!(
-                        model = %resolved_model,
+                        model = %served_model,
                         estimated_input_tokens,
                         context_limit = limit,
                         "estimated prompt exceeds context window; deferring to upstream tokenizer"
@@ -1563,7 +1526,7 @@ impl Gateway {
                     // C3: the early G3 estimate, threaded through so `run_turn` can
                     // stamp it onto `response.created` (see `created_event` below).
                     estimated_input_tokens,
-                    resolved_model,
+                    served_model,
                     vision_session,
                     // D1 (R1 #9): the engine binds `response_id → api_call_id` at
                     // the RequestStarted emission seam inside `run_turn`, not here.
@@ -1860,7 +1823,11 @@ impl Gateway {
         // instead of a hardcoded `0` — see that fn's doc comment for why the REAL
         // upstream count can't be used this early.
         estimated_input_tokens: i64,
-        upstream_model: String,
+        // The served-model LABEL from the profile route (the response `model`, the
+        // ReplayRecord key, and the serving-token's pre-routing model guess). NOT
+        // the dispatched model: the backend request keeps the original request
+        // model (below) so the router resolves the failover chain exactly once.
+        served_model: String,
         // G4: `Some(session_id)` when the image agent is active for this turn —
         // the key into `self.image_cache` the `analyzeImage` executor resolves
         // images against, and the signal to suppress `analyzeImage` streamed
@@ -1894,12 +1861,16 @@ impl Gateway {
         // failover/routing layers + the usage upsert below), making the guard's
         // terminal metrics fully independent of FlowStore retention.
         //
-        // D5 R4 (MEDIUM): this `upstream_model` is the engine's PRE-routing model; the
+        // D5 R4 (MEDIUM): this `served_model` is the engine's PRE-routing label; the
         // leaf rewrites `request.model` on failover/routing and then finalizes the ACTUAL
         // on-wire model onto the same token (`set_model_served_final`, which overwrites
         // this guess). So this write is the FALLBACK for the no-leaf / error-before-
         // dispatch path; the leaf's value wins when a flow reaches the wire.
-        serving_token.set_model_served(upstream_model.clone());
+        serving_token.set_model_served(served_model.clone());
+        // The dispatched backend model is the ORIGINAL (trimmed) request model; the
+        // router (`ProfileRoutingClient::chain_for`) resolves it once and each chain
+        // step rewrites `request.model` to the per-provider POSTed id.
+        let dispatch_model = request.model.trim().to_string();
         // D1 (R1 #9): bind this flow's `response_id` to its inbound `api_call_id`
         // exactly ONCE, at the RequestStarted emission seam (not pre-spawn). No-op
         // when the FlowStore is disabled or no `api_call_id` was threaded (the
@@ -2302,7 +2273,7 @@ impl Gateway {
                 response_format.clone(),
                 current_tool_choice.clone(),
                 UpstreamRequestAdditives {
-                    model: upstream_model.clone(),
+                    model: dispatch_model.clone(),
                     parallel_tool_calls,
                     reasoning_effort: reasoning_effort.clone(),
                     max_output_tokens: request.max_output_tokens,
@@ -2750,7 +2721,7 @@ impl Gateway {
                 tracing::warn!(
                     response_id = %response_id,
                     provider = %provider,
-                    served_model = %upstream_model,
+                    served_model = %served_model,
                     unknown_tools = ?unknown_tools,
                     offered_tools = tools.len(),
                     repair_round = unknown_tool_repair_rounds,
@@ -2773,7 +2744,7 @@ impl Gateway {
                     // inbound converters render in their own format.
                     self.record_unknown_tool_outcome(
                         &provider,
-                        &upstream_model,
+                        &served_model,
                         UnknownToolOutcome::Exhausted,
                     );
                     self.monitor
@@ -2787,7 +2758,7 @@ impl Gateway {
                     tracing::warn!(
                         response_id = %response_id,
                         provider = %provider,
-                        served_model = %upstream_model,
+                        served_model = %served_model,
                         repair_round = unknown_tool_repair_rounds,
                         "unknown-tool repair exhausted; ending turn with a structured terminal failure"
                     );
@@ -2848,7 +2819,7 @@ impl Gateway {
                     .unwrap_or_else(|| "unknown".to_string());
                 self.record_unknown_tool_outcome(
                     &provider,
-                    &upstream_model,
+                    &served_model,
                     UnknownToolOutcome::Repaired,
                 );
             }
@@ -2928,7 +2899,7 @@ impl Gateway {
             break;
         }
 
-        let model_name = upstream_model.clone();
+        let model_name = served_model.clone();
         let completed_output = response_output.clone();
         let metadata = request.metadata.clone();
         if request.store {
@@ -3019,113 +2990,6 @@ impl Gateway {
         })
     }
 
-    /// Resolve `model` against the upstream catalog, returning the served model
-    /// AND whether the resolution was GENUINE (true = the request truly maps to
-    /// the served backend; false = collapsed to a real, differing catalog
-    /// default because the model was blank/unmatched/ambiguous). The `genuine`
-    /// flag is a byproduct of this ONE ladder walk — not a re-derived
-    /// side-channel — so G4 gating (the only `genuine` consumer) keeps a single
-    /// resolution truth (T2 deleted `request_model_genuinely_resolves`).
-    async fn normalize_upstream_model(&self, model: &str) -> (String, bool) {
-        let catalog = match self.load_upstream_model_catalog().await {
-            Ok(catalog) => catalog,
-            Err(err) => {
-                tracing::warn!(model, error = %err, "failed to refresh upstream model catalog");
-                // Catalog unavailable ⇒ model flows through unchanged ⇒ genuine.
-                return (model.to_string(), true);
-            }
-        };
-        // Precedence:
-        //   1. exact catalog id (an exact id always wins),
-        //   2. unique canonical-key catalog match,
-        //   3. default catalog id.
-        // The engine normalizes against its own `UpstreamModelCatalog` (which
-        // also carries G3 context limits for G3 budgeting). T2 collapsed the
-        // GATING side-channel (`request_model_genuinely_resolves` deleted;
-        // `genuine` is now a byproduct of this walk, and the gate's candidates
-        // come from a typed `BackendCandidatePlan` on the routing layer). The
-        // ladder DEDUP here remains because
-        // `UpstreamModelCatalog::context_limit_by_id` feeds G3 budgeting, which
-        // T9 moves behind route/provider resolution — at which point this fn
-        // delegates to the routing catalog and the ladder collapses.
-        if let Some(exact) = catalog.exact_id(model) {
-            if exact != model {
-                tracing::info!(
-                    requested_model = %model,
-                    normalized_model = %exact,
-                    "normalized upstream model name from backend catalog"
-                );
-            }
-            return (exact, true);
-        }
-        if let Some(canonical) = catalog.canonical_unique(model) {
-            if canonical != model {
-                tracing::info!(
-                    requested_model = %model,
-                    normalized_model = %canonical,
-                    "normalized upstream model name from backend catalog"
-                );
-            }
-            return (canonical, true);
-        }
-        // No exact id, ad-hoc route, or canonical-key match: fall back to the
-        // first catalog model (claude-relay parity). A NON-BLANK requested model
-        // that lands here is a genuine mismatch — the loaded backend model
-        // differs from what the client asked for — so surface it at WARN. A
-        // blank/absent model defaulting to the first catalog id is expected and
-        // stays at INFO. Both blank and non-blank default-fallbacks are
-        // NON-genuine: the served model is the catalog default, not the request
-        // model (and a blank request has no model identity to attach an override
-        // to), so a `native_vision` override on the request model must NOT
-        // attach to the (different) default backend (G4 round-8 #1).
-        match catalog.default_id() {
-            Some(default) if model.trim().is_empty() => {
-                tracing::info!(
-                    fallback_model = %default,
-                    "no model requested; using the default catalog model"
-                );
-                (default, false)
-            }
-            Some(default) => {
-                if self.should_warn_model_fallback(model) {
-                    tracing::warn!(
-                        requested_model = %model,
-                        fallback_model = %default,
-                        "requested model is not served by any configured upstream; falling back to the default catalog model"
-                    );
-                }
-                (default, false)
-            }
-            None => {
-                // No default to collapse to (empty catalog) ⇒ the model passes
-                // through unchanged, so the request model IS the served model ⇒
-                // genuine (mirrors `RoutingModelCatalog::resolve` returning None
-                // for an empty catalog).
-                (model.to_string(), true)
-            }
-        }
-    }
-
-    /// Rate-limit the model-fallback WARN to once per catalog-TTL window per
-    /// requested model. A request resolves its model twice (HTTP label + engine
-    /// dispatch), and a mismatch usually persists across many requests, so an
-    /// un-throttled WARN would flood the log. Stale entries are pruned on access
-    /// so the map stays bounded even under random/hostile model names.
-    fn should_warn_model_fallback(&self, requested_model: &str) -> bool {
-        let now = std::time::Instant::now();
-        let window = std::time::Duration::from_secs(UPSTREAM_MODEL_CATALOG_TTL_SECS);
-        let mut warned = self
-            .model_fallback_warned
-            .lock()
-            .expect("model fallback warn lock poisoned");
-        warned.retain(|_, last| now.duration_since(*last) < window);
-        if warned.contains_key(requested_model) {
-            return false;
-        }
-        warned.insert(requested_model.to_string(), now);
-        true
-    }
-
     async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {
         let mut cache = self.upstream_model_catalog.lock().await;
         if let Some(cached) = cache.as_ref()
@@ -3133,9 +2997,9 @@ impl Gateway {
         {
             return Ok(cached.catalog.clone());
         }
-        // Single `/v1/models` snapshot feeds BOTH model normalization and G3
-        // context budgeting, so ids and context limits can never describe
-        // different provider states.
+        // The `/v1/models` snapshot backs the non-routing G3 context-budgeting
+        // fallback (per-model context-window lengths); routing/failover budgeting
+        // uses the routing layer's per-provider `BackendCandidatePlan` instead.
         let entries = self.upstream.supported_model_catalog().await?;
         let catalog = UpstreamModelCatalog::from_entries(entries);
         *cache = Some(CachedUpstreamModelCatalog {
