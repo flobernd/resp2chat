@@ -1,16 +1,17 @@
-//! HTTP routing behaviors for the config port (claude-relay `test_config.py`),
-//! the gateway-driving half. The pure config/TOML resolution tests live in the
-//! sibling `tests/port_config.rs`; this file drives the full gateway with
-//! wiremock upstreams and asserts served-model resolution and per-model leaf
-//! finalization.
+//! Routing behaviors for the config port (claude-relay `test_config.py`). The
+//! pure config/TOML resolution tests live in the sibling `tests/port_config.rs`;
+//! this file covers profile ROUTE RESOLUTION (`Config::resolve_route`) plus the
+//! per-model leaf finalization driven through the full gateway with a wiremock
+//! upstream.
 //!
-//! Glob/profile route DISPATCH tests land in Task 5 once profile resolution owns
-//! routing; this file currently covers the model-fallback response headers and
-//! the per-model reasoning-effort map at the upstream leaf.
+//! Request-model routing is expressed through `model_profiles`: an exact key
+//! (trimmed, case-insensitive) beats any glob, globs match first in declaration
+//! order, and `upstream_model` names what the leaf serves.
 
 mod common;
 
 use common::config_from_yaml;
+use llmconduit::config::Config;
 use serde_json::json;
 use tower::ServiceExt;
 use wiremock::Mock;
@@ -47,89 +48,131 @@ async fn mount_models_catalog(server: &MockServer, ids: &[&str]) {
         .await;
 }
 
-/// Mount an UNCONDITIONAL streaming `/v1/chat/completions` target that always
-/// answers with `chat_sse_body("chat", label)`.
-async fn mount_chat_target(server: &MockServer, label: &str) {
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(chat_sse_body("chat", label)),
-        )
-        .mount(server)
-        .await;
+// ---------------------------------------------------------------------------
+// `Config::resolve_route`: exact/glob/order/404/blank + `upstream_model`
+// defaulting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exact_profile_beats_glob_and_globs_match_in_declaration_order() {
+    let yaml = r#"
+upstreams: [{ name: a, url: "http://a/v1" }, { name: b, url: "http://b/v1" }, { name: c, url: "http://c/v1" }]
+model_profiles:
+  "claude-*":      { upstream: a }
+  "claude-opus-*": { upstream: b }
+  claude-opus-4:   { upstream: c, upstream_model: real-opus }
+"#;
+    let config = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap();
+    let exact = config.resolve_route("Claude-Opus-4").unwrap();
+    assert_eq!(
+        (exact.profile.upstream.as_str(), exact.served_model.as_str()),
+        ("c", "real-opus")
+    );
+    assert!(!exact.matched_glob);
+    let glob = config.resolve_route("claude-opus-4.1").unwrap();
+    assert_eq!(glob.profile.upstream, "a"); // first declared glob wins
+    assert_eq!(glob.served_model, "claude-opus-4.1"); // glob passes model through
+    assert!(glob.matched_glob);
+    assert!(config.resolve_route("gpt-4").is_none());
+    assert!(config.resolve_route("  ").is_none());
 }
 
-// ---------------------------------------------------------------------------
-// Per-request model-resolution headers (debug aid for model mismatches)
-// ---------------------------------------------------------------------------
-
-/// A request for a model the backend does not serve falls back to the loaded
-/// model, and the response is tagged with `x-llmconduit-model` (served) plus
-/// `x-llmconduit-requested` (the original) so the mismatch is visible per
-/// request — un-throttled, unlike the engine WARN. An exact match tags only the
-/// served model and omits `x-llmconduit-requested`.
-#[tokio::test]
-async fn response_headers_expose_model_fallback() {
-    let backend = MockServer::start().await;
-    mount_models_catalog(&backend, &["served-model"]).await;
-    mount_chat_target(&backend, "ok").await;
-
-    let config = config_from_yaml(&format!(
-        "upstreams:\n  - name: \"local\"\n    upstream_base_url: \"{}/v1/\"\n",
-        backend.uri()
-    ));
-
-    let header = |response: &axum::response::Response, name: &str| {
-        response
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-    };
-    let request = |model: &str| {
-        Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({
-                    "model": model,
-                    "stream": false,
-                    "messages": [{"role": "user", "content": "hi"}]
-                })
-                .to_string(),
-            ))
-            .expect("request")
-    };
-
-    // Mismatch: requested model is not served -> fallback + BOTH headers.
-    let mismatch = llmconduit::build_app(config.clone())
-        .oneshot(request("claude-opus-4"))
-        .await
-        .expect("response");
-    assert_eq!(mismatch.status().as_u16(), 200);
+#[test]
+fn resolve_route_serves_upstream_model_then_key_then_request_model() {
+    let yaml = r#"
+upstreams: [{ name: u, url: "http://u/v1" }]
+model_profiles:
+  remapped:  { upstream: u, upstream_model: backend-x }
+  identity:  { upstream: u }
+  "pass-*":  { upstream: u }
+"#;
+    let config = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap();
+    // `upstream_model` wins.
     assert_eq!(
-        header(&mismatch, "x-llmconduit-model").as_deref(),
-        Some("served-model")
+        config.resolve_route("remapped").unwrap().served_model,
+        "backend-x"
     );
+    // Else the exact key (trimmed) is served.
     assert_eq!(
-        header(&mismatch, "x-llmconduit-requested").as_deref(),
-        Some("claude-opus-4")
+        config.resolve_route(" identity ").unwrap().served_model,
+        "identity"
     );
+    // A glob with no `upstream_model` passes the request model through.
+    assert_eq!(
+        config.resolve_route("pass-7").unwrap().served_model,
+        "pass-7"
+    );
+}
 
-    // Exact match: served model requested -> served tag only, no `requested`.
-    let exact = llmconduit::build_app(config)
-        .oneshot(request("served-model"))
-        .await
-        .expect("response");
-    assert_eq!(exact.status().as_u16(), 200);
+#[test]
+fn resolve_route_blank_model_needs_glob_with_upstream_model() {
+    // A `*` glob that sets `upstream_model` resolves a blank request model.
+    let with_model = Config::from_persisted(
+        &serde_yaml::from_str(
+            r#"
+upstreams: [{ name: u, url: "http://u/v1" }]
+model_profiles:
+  "*": { upstream: u, upstream_model: fallback-model }
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let route = with_model.resolve_route("").unwrap();
+    assert!(route.matched_glob);
+    assert_eq!(route.served_model, "fallback-model");
+
+    // The same `*` glob WITHOUT `upstream_model` cannot serve a blank model
+    // (there is no request model to pass through).
+    let without_model = Config::from_persisted(
+        &serde_yaml::from_str(
+            r#"
+upstreams: [{ name: u, url: "http://u/v1" }]
+model_profiles:
+  "*": { upstream: u }
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(without_model.resolve_route("   ").is_none());
+    // A non-blank request still matches the `*` glob and passes through.
     assert_eq!(
-        header(&exact, "x-llmconduit-model").as_deref(),
-        Some("served-model")
+        without_model
+            .resolve_route("anything")
+            .unwrap()
+            .served_model,
+        "anything"
     );
-    assert_eq!(header(&exact, "x-llmconduit-requested"), None);
+}
+
+#[test]
+fn validation_rejects_bad_refs() {
+    for (profiles, needle) in [
+        ("M: { upstream: missing }", "unknown upstream"),
+        ("M: { upstream: l, fallbacks: [l] }", "primary"),
+        ("M: { upstream: l, fallbacks: [o, o] }", "duplicate"),
+        ("M: { upstream: l, image_analysis: { model: M } }", "itself"),
+        (
+            "M: { upstream: l, image_analysis: { model: nope } }",
+            "unknown",
+        ),
+        (
+            "M: { upstream: l, image_analysis: { model: \"v-*\" } }\n  \"v-*\": { upstream: l }",
+            "glob",
+        ),
+        (
+            "M: { upstream: l, image_analysis: { model: V } }\n  V: { upstream: l, image_analysis: { model: M } }",
+            "image_analysis",
+        ),
+        ("M: {}", "upstream"),
+    ] {
+        let yaml = format!(
+            "upstreams: [{{ name: l, url: \"http://h/v1\" }}, {{ name: o, url: \"http://o/v1\" }}]\nmodel_profiles:\n  {profiles}\n"
+        );
+        let err = Config::from_persisted(&serde_yaml::from_str(&yaml).unwrap()).unwrap_err();
+        assert!(err.contains(needle), "{profiles}: {err}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +181,7 @@ async fn response_headers_expose_model_fallback() {
 
 /// End-to-end through the REAL upstream leaf: a request whose effort maps via a
 /// model profile's `reasoning_effort_map` reaches the backend as
-/// `chat_template_kwargs.reasoning_effort`, against the FINAL resolved model.
+/// `chat_template_kwargs.reasoning_effort`, keyed by the FINAL resolved model.
 /// The POST mock only fires when the body carries the mapped knob, so a 200 (vs
 /// wiremock's 404 on no-match) proves the map was applied at the leaf.
 #[tokio::test]
@@ -146,7 +189,7 @@ async fn reasoning_effort_map_reaches_backend_chat_template_kwargs() {
     let backend = MockServer::start().await;
     mount_models_catalog(&backend, &["GLM-test"]).await;
     // Only matches when the leaf placed the mapped effort in chat_template_kwargs
-    // AND resolved the request model to the served backend model.
+    // for the served backend model.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(body_partial_json(json!({
@@ -168,6 +211,7 @@ upstreams:
     upstream_base_url: "{}/v1/"
 model_profiles:
   GLM-test:
+    upstream: backend
     reasoning_effort_default: max
     reasoning_effort_map:
       high: {{ chat_template_kwargs: {{ reasoning_effort: high }} }}
@@ -176,8 +220,8 @@ model_profiles:
         backend.uri()
     ));
 
-    // Anthropic request with Claude Code's adaptive-thinking + output_config.effort=high,
-    // model unserved by the backend so it falls back to GLM-test.
+    // Anthropic request for the profiled model with Claude Code's adaptive
+    // thinking + output_config.effort=high.
     let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
@@ -188,7 +232,7 @@ model_profiles:
                 .header("anthropic-version", "2023-06-01")
                 .body(Body::from(
                     json!({
-                        "model": "claude-opus-4",
+                        "model": "GLM-test",
                         "max_tokens": 16,
                         "stream": false,
                         "thinking": {"type": "adaptive"},

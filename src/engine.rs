@@ -1267,7 +1267,7 @@ impl Gateway {
         if let Some(guard) = &capture_guard {
             guard.set_model_served(&resolved_model);
         }
-        let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
+        let mut request = self.apply_system_prompt_prefix(request);
 
         // D1/E2b: minted here rather than just before the `tokio::spawn` below
         // (its only prior use) so the E2b residual-image-degrade monitor
@@ -1435,9 +1435,7 @@ impl Gateway {
         // a side-effect-free read, so computing them here is safe. Pass the image
         // agent flag so an injected/caller `analyzeImage` tool lowers as the
         // server-side ImageAnalysis kind (run by the gateway) on active turns.
-        let roles = self
-            .config
-            .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
+        let roles = self.config.resolve_roles_config(&request.model);
         let lowered = lower_request_with_image_agent_and_roles(
             &tail_request,
             baseline_record
@@ -1668,12 +1666,8 @@ impl Gateway {
     pub(crate) fn apply_system_prompt_prefix(
         &self,
         mut request: ResponsesRequest,
-        resolved_model: &str,
     ) -> ResponsesRequest {
-        let Some(prefix) = self
-            .config
-            .resolve_system_prompt_prefix_for_resolved_model(&request.model, resolved_model)
-        else {
+        let Some(prefix) = self.config.resolve_system_prompt_prefix(&request.model) else {
             return request;
         };
         request.instructions = if request.instructions.is_empty() {
@@ -2273,13 +2267,11 @@ impl Gateway {
         } else {
             request.parallel_tool_calls
         };
-        // The profile role policy for this resolved model — the SAME config the
-        // initial lowering used (`resolve_roles_config_for_resolved_model`,
-        // pre-spawn). Drives the pre-send adjacency merge + repair-note shaping
-        // below. `None` for a model with no `roles` profile (legacy passthrough).
-        let roles = self
-            .config
-            .resolve_roles_config_for_resolved_model(&request.model, &upstream_model);
+        // The profile role policy for this request model - the SAME config the
+        // initial lowering used (`resolve_roles_config`, pre-spawn). Drives the
+        // pre-send adjacency merge + repair-note shaping below. `None` for a
+        // model with no `roles` profile (legacy passthrough).
+        let roles = self.config.resolve_roles_config(&request.model);
         loop {
             // D6: compose the kill token with the client-hangup check — a dashboard
             // `abort()` flips `abort_token`, surfacing `cancelled()` (499) like a hang-up.

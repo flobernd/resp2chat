@@ -664,7 +664,7 @@ async fn uses_configured_upstream_model_override() {
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
-            model_profiles: std::collections::BTreeMap::new(),
+            model_profiles: Vec::new(),
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -753,7 +753,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
-            model_profiles: std::collections::BTreeMap::new(),
+            model_profiles: Vec::new(),
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -1107,7 +1107,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
-            model_profiles: std::collections::BTreeMap::new(),
+            model_profiles: Vec::new(),
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -1169,9 +1169,10 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
-            model_profiles: std::collections::BTreeMap::from([(
-                "Kimi-K2.6".to_string(),
-                llmconduit::config::ModelProfile {
+            model_profiles: vec![llmconduit::config::CompiledProfile {
+                key: "Kimi-K2.6".to_string(),
+                glob: None,
+                profile: llmconduit::config::ModelProfile {
                     upstream_model: None,
                     system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
@@ -1183,7 +1184,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                     )]),
                     ..Default::default()
                 },
-            )]),
+            }],
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -1232,15 +1233,16 @@ async fn prepends_profile_system_prompt_prefix_for_responses_requests() {
         .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
         .await;
     let mut config = test_config();
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "glm-5.1".to_string(),
-        llmconduit::config::ModelProfile {
+    config.model_profiles = vec![llmconduit::config::CompiledProfile {
+        key: "glm-5.1".to_string(),
+        glob: None,
+        profile: llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
         },
-    )]);
+    }];
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
 
     let _ = collect_stream(
@@ -2903,7 +2905,7 @@ async fn proxies_models_endpoint_with_etag() {
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: std::collections::BTreeMap::new(),
+        model_profiles: Vec::new(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -2981,7 +2983,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: std::collections::BTreeMap::new(),
+        model_profiles: Vec::new(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -3065,7 +3067,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: std::collections::BTreeMap::new(),
+        model_profiles: Vec::new(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -3152,7 +3154,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: std::collections::BTreeMap::new(),
+        model_profiles: Vec::new(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -3244,7 +3246,7 @@ async fn proxies_completions_endpoint_passthrough() {
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: std::collections::BTreeMap::new(),
+        model_profiles: Vec::new(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -7014,7 +7016,7 @@ fn test_config() -> Config {
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: std::collections::BTreeMap::new(),
+        model_profiles: Vec::new(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -7732,9 +7734,10 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
         upstream_request_log_path: None,
     }];
     config.upstream_failure_cooldown_secs = 3600;
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "client-model".to_string(),
-        llmconduit::config::ModelProfile {
+    config.model_profiles = vec![llmconduit::config::CompiledProfile {
+        key: "client-model".to_string(),
+        glob: None,
+        profile: llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_chat_kwargs: JsonMap::from_iter([(
@@ -7746,7 +7749,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
             )]),
             ..Default::default()
         },
-    )]);
+    }];
 
     let app = llmconduit::build_app(config);
     let request_body = json!({
@@ -8285,15 +8288,16 @@ async fn chat_completions_prepends_profile_system_prompt_prefix() {
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
     let mut config = test_config();
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "glm-5.1".to_string(),
-        llmconduit::config::ModelProfile {
+    config.model_profiles = vec![llmconduit::config::CompiledProfile {
+        key: "glm-5.1".to_string(),
+        glob: None,
+        profile: llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
         },
-    )]);
+    }];
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
@@ -8977,15 +8981,16 @@ async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
         .push_response(vec![Ok(content_chunk("chat-1", "done"))])
         .await;
     let mut config = test_config();
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "claude-3-5-sonnet-20241022".to_string(),
-        llmconduit::config::ModelProfile {
+    config.model_profiles = vec![llmconduit::config::CompiledProfile {
+        key: "claude-3-5-sonnet-20241022".to_string(),
+        glob: None,
+        profile: llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
         },
-    )]);
+    }];
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
@@ -9804,7 +9809,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: std::collections::BTreeMap::new(),
+        model_profiles: Vec::new(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -11048,13 +11053,14 @@ async fn e1_repair_note_honors_role_mapping_and_keeps_single_leading_system() {
     }))
     .expect("roles config");
     let mut config = test_config();
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "glm-5.1".to_string(),
-        llmconduit::config::ModelProfile {
+    config.model_profiles = vec![llmconduit::config::CompiledProfile {
+        key: "glm-5.1".to_string(),
+        glob: None,
+        profile: llmconduit::config::ModelProfile {
             roles: Some(roles),
             ..Default::default()
         },
-    )]);
+    }];
 
     let upstream = MockUpstream::default();
     // Round 1: the model hallucinates an unoffered tool (`Grep`) -> soft-reject.

@@ -3264,17 +3264,64 @@ fn status_is_request_intrinsic_4xx(status: StatusCode) -> bool {
 /// engine no longer threads `template_family` / `upstream_chat_kwargs` down the
 /// wire DTO, and `ChatCompletionRequest` carries no `#[serde(skip)]` side-channel
 /// fields. The leaf is the single point that knows the FINAL `request.model`.
+/// A per-model leaf policy table: EXACT entries keyed by the effective backend
+/// model an exact profile serves, plus an ordered list of GLOB entries from
+/// glob-keyed profiles. Lookup mirrors `Config::resolve_route`'s precedence -
+/// an exact match wins, then the first matching glob in declaration order - so
+/// the leaf resolves the FINAL provider model the same way routing does.
+#[derive(Clone, Debug)]
+pub struct LeafPolicyMap<V> {
+    /// Keyed by effective backend model (`upstream_model` or the exact key).
+    pub exact: std::collections::BTreeMap<String, V>,
+    /// Compiled glob matcher + policy, in declaration order.
+    pub globs: Vec<(Regex, V)>,
+}
+
+impl<V> Default for LeafPolicyMap<V> {
+    fn default() -> Self {
+        Self {
+            exact: std::collections::BTreeMap::new(),
+            globs: Vec::new(),
+        }
+    }
+}
+
+impl<V> LeafPolicyMap<V> {
+    /// Resolve the policy for the FINAL provider `model`: an exact id (then a
+    /// canonical-key match - case/punctuation-insensitive - only when exactly
+    /// one exact entry shares that key, so an ambiguous pick is deterministic),
+    /// else the first glob whose pattern matches. `None` when nothing applies.
+    fn get(&self, model: &str) -> Option<&V> {
+        if let Some(policy) = self.exact.get(model) {
+            return Some(policy);
+        }
+        let key = canonical_model_key(model);
+        let mut matches = self
+            .exact
+            .iter()
+            .filter(|(name, _)| canonical_model_key(name) == key)
+            .map(|(_, policy)| policy);
+        if let (Some(policy), None) = (matches.next(), matches.next()) {
+            return Some(policy);
+        }
+        self.globs
+            .iter()
+            .find(|(glob, _)| glob.is_match(model))
+            .map(|(_, policy)| policy)
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct BackendFinalizationPolicies {
     /// Per-model reasoning-effort policy (`reasoning_effort_map` + default).
-    pub effort: Arc<std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>>,
+    pub effort: Arc<LeafPolicyMap<crate::config::ReasoningEffortPolicy>>,
     /// Per-model `template_family` override (normalized `kimi`/`deepseek`).
-    pub template_family: Arc<std::collections::BTreeMap<String, String>>,
+    pub template_family: Arc<LeafPolicyMap<String>>,
     /// GLOBAL `template_family` fallback (normalized), applied when no per-model
     /// policy matches the FINAL model.
     pub global_template_family: Option<String>,
     /// Per-model extends-merged `upstream_chat_kwargs`.
-    pub upstream_chat_kwargs: Arc<std::collections::BTreeMap<String, JsonMap<String, Value>>>,
+    pub upstream_chat_kwargs: Arc<LeafPolicyMap<JsonMap<String, Value>>>,
     /// GLOBAL `upstream_chat_kwargs` (base layer), merged under the per-model
     /// policy at the leaf.
     pub global_upstream_chat_kwargs: Arc<JsonMap<String, Value>>,
@@ -3288,57 +3335,42 @@ impl BackendFinalizationPolicies {
     /// production leaf receives (T1).
     pub fn from_config(config: &crate::config::Config) -> Self {
         Self {
-            effort: Arc::new(config.reasoning_effort_policies()),
-            template_family: Arc::new(config.template_family_policies()),
+            effort: Arc::new(LeafPolicyMap {
+                exact: config.reasoning_effort_policies(),
+                globs: config.reasoning_effort_policy_globs(),
+            }),
+            template_family: Arc::new(LeafPolicyMap {
+                exact: config.template_family_policies(),
+                globs: config.template_family_policy_globs(),
+            }),
             global_template_family: config.global_template_family(),
-            upstream_chat_kwargs: Arc::new(config.upstream_chat_kwargs_policies()),
+            upstream_chat_kwargs: Arc::new(LeafPolicyMap {
+                exact: config.upstream_chat_kwargs_policies(),
+                globs: config.upstream_chat_kwargs_policy_globs(),
+            }),
             global_upstream_chat_kwargs: Arc::new(config.global_upstream_chat_kwargs().clone()),
         }
     }
 
     /// Resolve the `template_family` override for the FINAL provider `model`:
-    /// the per-model policy wins (exact then canonical-key match, mirroring
-    /// `Config::model_profile` / `reasoning_effort_fragment`), else the global
+    /// the per-model policy wins (exact/canonical then glob), else the global
     /// fallback. `None` means sniff the model id instead.
     fn resolve_family_override(&self, model: &str) -> Option<String> {
-        policy_for_model(&self.template_family, model)
+        self.template_family
+            .get(model)
             .cloned()
             .or_else(|| self.global_template_family.clone())
     }
 
     /// The extends-merged `upstream_chat_kwargs` for the FINAL provider `model`:
-    /// the per-model policy (exact then canonical-key match) layered over the
-    /// global base (per-model wins on conflict). Empty when neither applies.
+    /// the per-model policy (exact/canonical then glob) layered over the global
+    /// base (per-model wins on conflict). Empty when neither applies.
     fn resolve_chat_kwargs(&self, model: &str) -> JsonMap<String, Value> {
         let mut merged = (*self.global_upstream_chat_kwargs).clone();
-        if let Some(per_model) = policy_for_model(&self.upstream_chat_kwargs, model) {
+        if let Some(per_model) = self.upstream_chat_kwargs.get(model) {
             merge_json_maps(&mut merged, per_model);
         }
         merged
-    }
-}
-/// Look up a per-model policy in `map` for the FINAL provider `model` with the
-/// SAME semantics as `Config::model_profile` and `RoutingModelCatalog` model
-/// matching: exact (case-sensitive) id first, then a canonical-key match
-/// (case/punctuation-insensitive) ONLY when unambiguous (exactly one profile
-/// shares that canonical key — two would make the pick order-dependent). `None`
-/// when no policy applies. Keeps the leaf's per-model policy lookup consistent
-/// with how profiles are matched everywhere else (T1).
-fn policy_for_model<'a, V>(
-    map: &'a std::collections::BTreeMap<String, V>,
-    model: &str,
-) -> Option<&'a V> {
-    if let Some(policy) = map.get(model) {
-        return Some(policy);
-    }
-    let key = canonical_model_key(model);
-    let mut matches = map
-        .iter()
-        .filter(|(name, _)| canonical_model_key(name) == key)
-        .map(|(_, policy)| policy);
-    match (matches.next(), matches.next()) {
-        (Some(policy), None) => Some(policy),
-        _ => map.get("*"),
     }
 }
 
@@ -3797,7 +3829,7 @@ pub fn finalize_request_for_backend(
     //    its OWN kwargs, not the alias's.
     merge_chat_kwargs_gap_fill(request, &policies.resolve_chat_kwargs(&request.model));
     // 2. Reasoning effort: map (→ fragment, top-level cleared) or clamp.
-    let effort_policy = policy_for_model(&policies.effort, &request.model);
+    let effort_policy = policies.effort.get(&request.model);
     let fragment = reasoning_effort_fragment(
         &policies.effort,
         &request.model,
@@ -3859,7 +3891,9 @@ fn apply_profile_thinking_kwarg(
     let Some(enabled) = backend.thinking_override else {
         return;
     };
-    let reasoning_config = policy_for_model(&policies.effort, &backend.request.model)
+    let reasoning_config = policies
+        .effort
+        .get(&backend.request.model)
         .and_then(|policy| policy.upstream_reasoning.as_ref());
     let family_override = policies.resolve_family_override(&backend.request.model);
     let family = detect_model_family(&backend.request.model, family_override.as_deref());
@@ -3953,11 +3987,11 @@ fn clamp_reasoning_effort(effort: Option<&str>) -> Option<String> {
 /// (after defaulting) is not mapped. Lookup is exact, then canonical-key
 /// (case/punctuation-insensitive), mirroring catalog/profile model matching.
 fn reasoning_effort_fragment(
-    policies: &std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>,
+    policies: &LeafPolicyMap<crate::config::ReasoningEffortPolicy>,
     model: &str,
     raw_effort: Option<&str>,
 ) -> Option<Value> {
-    let policy = policy_for_model(policies, model)?;
+    let policy = policies.get(model)?;
     let level = raw_effort
         .map(str::trim)
         .filter(|level| !level.is_empty())
@@ -5093,29 +5127,31 @@ mod tests {
             .expect("chat_template_kwargs object")
     }
 
-    fn glm_effort_policies()
-    -> std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy> {
-        std::collections::BTreeMap::from([(
-            "GLM-5.2-NVFP4-MTP".to_string(),
-            crate::config::ReasoningEffortPolicy {
-                default: Some("max".to_string()),
-                upstream_reasoning: None,
-                map: std::collections::BTreeMap::from([
-                    (
-                        "high".to_string(),
-                        json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
-                    ),
-                    (
-                        "max".to_string(),
-                        json!({"chat_template_kwargs": {"reasoning_effort": "max"}}),
-                    ),
-                    (
-                        "none".to_string(),
-                        json!({"chat_template_kwargs": {"enable_thinking": false}}),
-                    ),
-                ]),
-            },
-        )])
+    fn glm_effort_policies() -> super::LeafPolicyMap<crate::config::ReasoningEffortPolicy> {
+        super::LeafPolicyMap {
+            exact: std::collections::BTreeMap::from([(
+                "GLM-5.2-NVFP4-MTP".to_string(),
+                crate::config::ReasoningEffortPolicy {
+                    default: Some("max".to_string()),
+                    upstream_reasoning: None,
+                    map: std::collections::BTreeMap::from([
+                        (
+                            "high".to_string(),
+                            json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
+                        ),
+                        (
+                            "max".to_string(),
+                            json!({"chat_template_kwargs": {"reasoning_effort": "max"}}),
+                        ),
+                        (
+                            "none".to_string(),
+                            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                        ),
+                    ]),
+                },
+            )]),
+            globs: Vec::new(),
+        }
     }
 
     /// Wrap a family-request with optional client kwargs into the leaf wrapper.
@@ -5146,12 +5182,13 @@ mod tests {
     /// Finalization policies carrying a per-model `template_family` override.
     fn family_policies(per_model: &[(&str, &str)]) -> BackendFinalizationPolicies {
         BackendFinalizationPolicies {
-            template_family: Arc::new(
-                per_model
+            template_family: Arc::new(super::LeafPolicyMap {
+                exact: per_model
                     .iter()
                     .map(|(m, f)| (m.to_string(), f.to_string()))
                     .collect(),
-            ),
+                globs: Vec::new(),
+            }),
             ..Default::default()
         }
     }
@@ -5198,8 +5235,8 @@ mod tests {
         // Ambiguous canonical match (two profiles, same canonical key, neither an
         // exact id match) -> no policy, deterministically.
         let mut ambiguous = glm_effort_policies();
-        let dup = ambiguous["GLM-5.2-NVFP4-MTP"].clone();
-        ambiguous.insert("glm5.2nvfp4mtp".to_string(), dup);
+        let dup = ambiguous.exact["GLM-5.2-NVFP4-MTP"].clone();
+        ambiguous.exact.insert("glm5.2nvfp4mtp".to_string(), dup);
         assert!(reasoning_effort_fragment(&ambiguous, "GLM!5.2!NVFP4!MTP", Some("high")).is_none());
     }
 

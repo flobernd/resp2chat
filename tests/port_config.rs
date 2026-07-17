@@ -138,7 +138,7 @@ upstream_model = "Kimi-K2.6"
     assert_eq!(config.upstreams[0].name, "opus");
     assert_eq!(config.upstreams[0].url.as_str(), "http://opus:8000/v1");
     let profile = config.model_profile("claude-opus-*").expect("profile");
-    assert_eq!(profile.upstream.as_deref(), Some("opus"));
+    assert_eq!(profile.upstream, "opus");
     assert_eq!(profile.upstream_model.as_deref(), Some("Kimi-K2.6"));
 }
 
@@ -154,8 +154,12 @@ fn template_family_still_resolves_through_profile_chain() {
     let config = config_from_yaml(
         r#"
 template_family: deepseek
+upstreams:
+  - name: backend
+    url: "http://h/v1"
 model_profiles:
   "Router-X":
+    upstream: backend
     template_family: kimi
 "#,
     );
@@ -302,13 +306,12 @@ model_profiles:
   Qwen3-VL:
     upstream: vl
 "#;
-    // Parse-level assertions only: resolve_route lands in Task 5. In this task
-    // the runtime ModelProfile carries `upstream: Option<String>` (no
-    // requiredness validation yet); Task 5 tightens it to `String` and
-    // migrates these assertions to resolve_route.
+    // The runtime `ModelProfile` carries a required `upstream: String` plus its
+    // resolved fallbacks and `image_analysis`; route resolution is covered by
+    // `resolve_route` in `tests/port_config_routing.rs`.
     let config = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap();
     let profile = config.model_profile("GLM-5.2").expect("profile");
-    assert_eq!(profile.upstream.as_deref(), Some("local"));
+    assert_eq!(profile.upstream, "local");
     assert_eq!(profile.fallbacks[0].model.as_deref(), Some("z-ai/glm-5.2"));
     assert_eq!(profile.fallbacks[1].upstream, "vl");
     assert!(profile.fallbacks[1].model.is_none());
@@ -344,8 +347,8 @@ model_profiles:
 
 // ---------------------------------------------------------------------------
 // `OrderedModelProfiles`: declaration order, duplicate-key collapse, round
-// trip, and the shared glob compiler (Task 3). Resolution against a glob
-// profile key lands in Task 5; this task only preserves the persisted shape.
+// trip, and the shared glob compiler. These preserve the persisted shape;
+// glob-aware route resolution is covered by `resolve_route`.
 // ---------------------------------------------------------------------------
 
 /// Persisted `model_profiles` preserve DECLARATION order, not alphabetical

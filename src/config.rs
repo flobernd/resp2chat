@@ -568,7 +568,10 @@ pub struct Config {
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
-    pub model_profiles: BTreeMap<String, ModelProfile>,
+    /// Request-model routing table in DECLARATION order: each entry is a
+    /// profile key (literal or glob), its compiled matcher, and the resolved
+    /// profile. `resolve_route` scans it exact-first, then globs first-match.
+    pub model_profiles: Vec<CompiledProfile>,
     /// Vestigial ad-hoc model routes: `from_persisted` now always leaves this
     /// empty, since request-model routing is expressed through `model_profiles`.
     /// The field and its consumers stay until Tasks 6-7 delete the runtime
@@ -1018,8 +1021,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
 ///
 /// A `Vec` of pairs rather than a `BTreeMap`, mirroring `OrderedModelRoutes`,
 /// so profile keys keep their DECLARATION order: a glob-capable profile key
-/// (Task 5) needs first-match-wins scanning when two globs overlap, and a
-/// `BTreeMap` would silently re-sort keys alphabetically. Both serde_yaml and
+/// needs first-match-wins scanning when two globs overlap, and a `BTreeMap`
+/// would silently re-sort keys alphabetically. Both serde_yaml and
 /// the `toml` crate (with `preserve_order`) yield map entries in document
 /// order, so the file order is the resolution order.
 ///
@@ -1127,7 +1130,9 @@ impl From<PersistedProfileFallback> for ProfileFallback {
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
-    pub upstream: Option<String>,
+    /// Validated reference into `config.upstreams` (required after `extends`
+    /// merge). Names the primary endpoint this profile routes to.
+    pub upstream: String,
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub roles: Option<RolesConfig>,
@@ -1140,6 +1145,29 @@ pub struct ModelProfile {
     pub reasoning_effort: Option<ReasoningConfig>,
     pub fallbacks: Vec<ProfileFallback>,
     pub image_analysis: Option<ImageAnalysisConfig>,
+}
+
+/// A model profile compiled for resolution: the declared key, its glob matcher
+/// (`None` for a literal key matched by exact, trimmed, case-insensitive
+/// comparison), and the resolved profile. Held in DECLARATION order so
+/// overlapping globs resolve first-match-wins.
+#[derive(Debug, Clone)]
+pub struct CompiledProfile {
+    pub key: String,
+    pub glob: Option<Regex>,
+    pub profile: ModelProfile,
+}
+
+/// The outcome of resolving a request model against the compiled profiles: the
+/// matched profile plus the model id to serve upstream.
+#[derive(Debug, Clone)]
+pub struct ResolvedRoute<'a> {
+    pub profile_key: &'a str,
+    pub profile: &'a ModelProfile,
+    /// `upstream_model` when set, else the exact profile key, else the trimmed
+    /// request model passed through (a glob match carries no key to serve).
+    pub served_model: String,
+    pub matched_glob: bool,
 }
 
 /// Resolved reasoning-effort policy for a backend model: canonical effort level
@@ -1521,6 +1549,7 @@ impl Config {
         let upstreams = parse_upstreams(&config.upstreams)?;
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
+        validate_model_profiles(&model_profiles, &upstreams)?;
         Ok(Self {
             bind_addr,
             // Vestigial single-upstream fields kept compiling with inert defaults;
@@ -1595,10 +1624,97 @@ impl Config {
     }
 
     pub fn resolve_upstream_model(&self, request_model: &str) -> String {
-        self.model_profile(request_model)
-            .and_then(|profile| profile.upstream_model.clone())
+        self.resolve_route(request_model)
+            .map(|route| route.served_model)
+            // Vestigial global override, kept until the legacy field is removed.
             .or_else(|| self.upstream_model.clone())
-            .unwrap_or_else(|| request_model.to_string())
+            .unwrap_or_else(|| request_model.trim().to_string())
+    }
+
+    /// Resolve `request_model` against the compiled profiles. An exact key
+    /// (trimmed, case-insensitive) beats any glob regardless of declaration
+    /// order; globs match first in declaration order. Returns `None` (a 404)
+    /// when nothing matches. A blank request model resolves only through a glob
+    /// whose regex matches the empty string AND that sets `upstream_model`,
+    /// since there is no request model to pass through.
+    pub fn resolve_route(&self, request_model: &str) -> Option<ResolvedRoute<'_>> {
+        let trimmed = request_model.trim();
+        if !trimmed.is_empty() {
+            // Prefer an exact-case match, then a case-insensitive one, mirroring
+            // `model_profile`, so two keys differing only in case pick the exact.
+            let exact = self
+                .model_profiles
+                .iter()
+                .find(|cp| cp.glob.is_none() && cp.key.trim() == trimmed)
+                .or_else(|| {
+                    self.model_profiles
+                        .iter()
+                        .find(|cp| cp.glob.is_none() && cp.key.trim().eq_ignore_ascii_case(trimmed))
+                });
+            if let Some(cp) = exact {
+                let served_model = cp
+                    .profile
+                    .upstream_model
+                    .clone()
+                    .unwrap_or_else(|| cp.key.trim().to_string());
+                return Some(ResolvedRoute {
+                    profile_key: cp.key.as_str(),
+                    profile: &cp.profile,
+                    served_model,
+                    matched_glob: false,
+                });
+            }
+        }
+        for cp in &self.model_profiles {
+            let Some(glob) = &cp.glob else {
+                continue;
+            };
+            if !glob.is_match(trimmed) {
+                continue;
+            }
+            if trimmed.is_empty() {
+                // No request model to pass through: a blank model needs the glob
+                // profile's own `upstream_model` to name what to serve.
+                return cp
+                    .profile
+                    .upstream_model
+                    .clone()
+                    .map(|served_model| ResolvedRoute {
+                        profile_key: cp.key.as_str(),
+                        profile: &cp.profile,
+                        served_model,
+                        matched_glob: true,
+                    });
+            }
+            let served_model = cp
+                .profile
+                .upstream_model
+                .clone()
+                .unwrap_or_else(|| trimmed.to_string());
+            return Some(ResolvedRoute {
+                profile_key: cp.key.as_str(),
+                profile: &cp.profile,
+                served_model,
+                matched_glob: true,
+            });
+        }
+        None
+    }
+
+    /// Non-glob profile keys in declaration order.
+    pub fn exact_profile_keys(&self) -> impl Iterator<Item = &str> {
+        self.model_profiles
+            .iter()
+            .filter(|cp| cp.glob.is_none())
+            .map(|cp| cp.key.as_str())
+    }
+
+    /// The `upstreams:` entry named `name` (trimmed, case-insensitive lookup).
+    pub fn upstream_by_name(&self, name: &str) -> Option<&UpstreamConfig> {
+        let name = name.trim();
+        self.upstreams
+            .iter()
+            .find(|upstream| upstream.name.trim().eq_ignore_ascii_case(name))
     }
 
     /// The configured [`ModelPrice`] for `model` (T13/D13). Exact key match first,
@@ -1642,90 +1758,56 @@ impl Config {
             && self.fallback_upstreams.is_empty()
     }
 
-    /// Per-BACKEND-MODEL reasoning-effort policies, keyed by the resolved model
-    /// id (profile name). Applied at the upstream LEAF — the single point that
-    /// knows the FINAL provider model after routing/failover/exposed-alias remap
-    /// — so a route/failover target gets its OWN model's effort vocabulary rather
-    /// than the request alias's. Both the fork's fragment-based map and the
-    /// upstream-compatible typed shorthand are compiled into the same leaf
-    /// policy, after profile inheritance has resolved.
+    /// Per-BACKEND-MODEL reasoning-effort policies for exact leaf lookup, keyed
+    /// by the effective backend model (`upstream_model` if set, else the profile
+    /// key) - the id the leaf POSTs. Applied at the upstream leaf, the single
+    /// point that knows the FINAL provider model after routing/failover, so a
+    /// route/failover target gets its OWN model's effort vocabulary rather than
+    /// the request alias's. A glob profile that pins `upstream_model` serves a
+    /// fixed id, so it is registered here (not in the glob list); glob profiles
+    /// without `upstream_model` are exposed by [`reasoning_effort_policy_globs`].
+    /// Both the fork's fragment-based map and the upstream-compatible typed
+    /// shorthand compile into the same leaf policy.
+    ///
+    /// [`reasoning_effort_policy_globs`]: Config::reasoning_effort_policy_globs
     pub fn reasoning_effort_policies(&self) -> BTreeMap<String, ReasoningEffortPolicy> {
-        self.model_profiles
-            .iter()
-            .filter(|(_, profile)| {
-                !profile.reasoning_effort_map.is_empty() || profile.reasoning_effort.is_some()
-            })
-            .map(|(name, profile)| {
-                let (map, default, upstream_reasoning) =
-                    if let Some(reasoning) = &profile.reasoning_effort {
-                        let mut map: BTreeMap<String, JsonValue> = reasoning
-                            .map
-                            .iter()
-                            .map(|(level, mapped)| {
-                                (
-                                    level.trim().to_ascii_lowercase(),
-                                    serde_json::json!({"reasoning_effort": mapped}),
-                                )
-                            })
-                            .collect();
-                        let default = trim_nonempty(reasoning.default.as_deref())
-                            .map(|level| level.to_ascii_lowercase());
-                        // Upstream semantics do not run the configured default
-                        // back through `map`: the default is emitted verbatim.
-                        if let Some(level) = &default {
-                            map.insert(
-                                level.clone(),
-                                serde_json::json!({"reasoning_effort": level}),
-                            );
-                        }
-                        (map, default, Some(reasoning.clone()))
-                    } else {
-                        (
-                            profile
-                                .reasoning_effort_map
-                                .iter()
-                                .map(|(level, fragment)| {
-                                    (level.trim().to_ascii_lowercase(), fragment.clone())
-                                })
-                                .collect(),
-                            trim_nonempty(profile.reasoning_effort_default.as_deref())
-                                .map(|level| level.to_ascii_lowercase()),
-                            None,
-                        )
-                    };
-                (
-                    name.clone(),
-                    ReasoningEffortPolicy {
-                        map,
-                        default,
-                        upstream_reasoning,
-                    },
-                )
-            })
-            .collect()
+        build_exact_policies(&self.model_profiles, reasoning_effort_policy_of)
     }
 
-    /// Per-BACKEND-MODEL `template_family` override policies, keyed by the
-    /// resolved model id (profile name). Applied at the upstream LEAF — the
-    /// single point that knows the FINAL provider model after routing/failover/
-    /// exposed-alias remap — so a route/failover target gets its OWN model's
-    /// family override rather than the request alias's (T1). Each profile's
-    /// `template_family` is already normalized to `kimi`/`deepseek` at
-    /// construction. Only profiles that set a family are included; the GLOBAL
-    /// `template_family` is exposed separately by [`global_template_family`]
-    /// and the leaf folds it in as the fallback when no per-model policy matches.
+    /// Reasoning-effort policies for glob profiles WITHOUT `upstream_model`,
+    /// paired with their compiled matcher, in declaration order. Such a profile
+    /// passes the request model through, so the leaf pattern-matches the POSTed
+    /// id; a glob profile that pins `upstream_model` is an exact entry instead.
+    pub fn reasoning_effort_policy_globs(&self) -> Vec<(Regex, ReasoningEffortPolicy)> {
+        build_glob_policies(&self.model_profiles, reasoning_effort_policy_of)
+    }
+
+    /// Per-BACKEND-MODEL `template_family` overrides for exact leaf lookup, keyed
+    /// by the effective backend model (`upstream_model` if set, else the profile
+    /// key). Applied at the upstream leaf, the single point that knows the FINAL
+    /// provider model after routing/failover, so a route/failover target gets its
+    /// OWN model's family override rather than the request alias's (T1). Each
+    /// profile's `template_family` is already normalized to `kimi`/`deepseek` at
+    /// construction. Glob profiles without `upstream_model` are exposed by
+    /// [`template_family_policy_globs`] and the GLOBAL `template_family` by
+    /// [`global_template_family`], which the leaf folds in as the fallback when no
+    /// per-model policy matches.
     ///
+    /// [`template_family_policy_globs`]: Config::template_family_policy_globs
     /// [`global_template_family`]: Config::global_template_family
     pub fn template_family_policies(&self) -> BTreeMap<String, String> {
-        self.model_profiles
-            .iter()
-            .filter_map(|(name, profile)| {
-                profile
-                    .template_family
-                    .clone()
-                    .map(|family| (name.clone(), family))
-            })
-            .collect()
+        build_exact_policies(&self.model_profiles, |profile| {
+            profile.template_family.clone()
+        })
+    }
+
+    /// `template_family` overrides for glob profiles WITHOUT `upstream_model`,
+    /// paired with their compiled matcher, in declaration order (matched against
+    /// the POSTed model).
+    pub fn template_family_policy_globs(&self) -> Vec<(Regex, String)> {
+        build_glob_policies(&self.model_profiles, |profile| {
+            profile.template_family.clone()
+        })
     }
 
     /// The GLOBAL `template_family` override (already normalized), applied by
@@ -1736,28 +1818,32 @@ impl Config {
         self.template_family.clone()
     }
 
-    /// Per-BACKEND-MODEL `upstream_chat_kwargs` policies, keyed by the resolved
-    /// model id (profile name). Applied at the upstream LEAF — the single point
-    /// that knows the FINAL provider model after routing/failover/exposed-alias
-    /// remap — so a route/failover target gets its OWN model's kwargs rather
-    /// than the request alias's (T1). Each profile's `upstream_chat_kwargs` is
-    /// already extends-merged at construction. Only non-empty profiles are
-    /// included; the GLOBAL `upstream_chat_kwargs` is exposed separately by
-    /// [`global_upstream_chat_kwargs`] and the leaf merges it as the base layer
-    /// under the per-profile policy.
+    /// Per-BACKEND-MODEL `upstream_chat_kwargs` policies for exact leaf lookup,
+    /// keyed by the effective backend model (`upstream_model` if set, else the
+    /// profile key). Applied at the upstream leaf, the single point that knows
+    /// the FINAL provider model after routing/failover, so a route/failover
+    /// target gets its OWN model's kwargs rather than the request alias's (T1).
+    /// Each profile's `upstream_chat_kwargs` is already extends-merged at
+    /// construction. Glob profiles without `upstream_model` are exposed by
+    /// [`upstream_chat_kwargs_policy_globs`]; the GLOBAL `upstream_chat_kwargs`
+    /// is exposed by [`global_upstream_chat_kwargs`] and merged by the leaf as
+    /// the base layer under the per-profile policy.
     ///
+    /// [`upstream_chat_kwargs_policy_globs`]: Config::upstream_chat_kwargs_policy_globs
     /// [`global_upstream_chat_kwargs`]: Config::global_upstream_chat_kwargs
     pub fn upstream_chat_kwargs_policies(&self) -> BTreeMap<String, JsonMap<String, JsonValue>> {
-        self.model_profiles
-            .iter()
-            .filter_map(|(name, profile)| {
-                if profile.upstream_chat_kwargs.is_empty() {
-                    None
-                } else {
-                    Some((name.clone(), profile.upstream_chat_kwargs.clone()))
-                }
-            })
-            .collect()
+        build_exact_policies(&self.model_profiles, |profile| {
+            (!profile.upstream_chat_kwargs.is_empty()).then(|| profile.upstream_chat_kwargs.clone())
+        })
+    }
+
+    /// `upstream_chat_kwargs` for glob profiles WITHOUT `upstream_model`, paired
+    /// with their compiled matcher, in declaration order (matched against the
+    /// POSTed model).
+    pub fn upstream_chat_kwargs_policy_globs(&self) -> Vec<(Regex, JsonMap<String, JsonValue>)> {
+        build_glob_policies(&self.model_profiles, |profile| {
+            (!profile.upstream_chat_kwargs.is_empty()).then(|| profile.upstream_chat_kwargs.clone())
+        })
     }
 
     /// The GLOBAL `upstream_chat_kwargs` (base layer), merged by the leaf under
@@ -1775,21 +1861,13 @@ impl Config {
         None
     }
 
+    /// The system-prompt prefix for `request_model`: the global prefix followed
+    /// by the resolved profile's prefix (if any), joined with a blank line. A
+    /// single profile applies - the one `resolve_route` selects.
     pub fn resolve_system_prompt_prefix(&self, request_model: &str) -> Option<String> {
-        let upstream_model = self.resolve_upstream_model(request_model);
-        self.resolve_system_prompt_prefix_for_resolved_model(request_model, &upstream_model)
-    }
-
-    pub fn resolve_system_prompt_prefix_for_resolved_model(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> Option<String> {
         let profile_prefix = self
-            .model_profiles_for_resolved_model(request_model, resolved_model)
-            .into_iter()
-            .rev()
-            .find_map(|profile| profile.system_prompt_prefix.clone());
+            .resolve_route(request_model)
+            .and_then(|route| route.profile.system_prompt_prefix.clone());
         join_prompt_prefixes(
             [self.system_prompt_prefix.clone(), profile_prefix]
                 .into_iter()
@@ -1804,64 +1882,143 @@ impl Config {
         if let Some(profile) = self.model_profile(id) {
             return profile.capabilities.as_ref();
         }
-        for profile in self.model_profiles.values() {
-            if profile
+        for cp in &self.model_profiles {
+            if cp
+                .profile
                 .upstream_model
                 .as_deref()
                 .is_some_and(|model| model.eq_ignore_ascii_case(id))
             {
-                return profile.capabilities.as_ref();
+                return cp.profile.capabilities.as_ref();
             }
         }
         self.model_profile("*")
             .and_then(|profile| profile.capabilities.as_ref())
     }
 
-    pub fn resolve_roles_config_for_resolved_model(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> Option<&RolesConfig> {
-        self.model_profiles_for_resolved_model(request_model, resolved_model)
-            .into_iter()
-            .rev()
-            .find_map(|profile| profile.roles.as_ref())
+    /// The role-mapping policy for `request_model`, from the single profile
+    /// `resolve_route` selects. `None` when no profile matches or it sets none.
+    pub fn resolve_roles_config(&self, request_model: &str) -> Option<&RolesConfig> {
+        self.resolve_route(request_model)?.profile.roles.as_ref()
     }
 
-    fn model_profiles_for_resolved_model(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> Vec<&ModelProfile> {
-        let mut profiles: Vec<&ModelProfile> = Vec::new();
-        let configured_model = self.resolve_upstream_model(request_model);
-        for model in [resolved_model, configured_model.as_str(), request_model] {
-            if let Some(profile) = self.model_profile(model)
-                && !profiles
-                    .iter()
-                    .any(|existing| std::ptr::eq(*existing, profile))
-            {
-                profiles.push(profile);
-            }
-        }
-        if profiles.is_empty()
-            && let Some(profile) = self.model_profile("*")
-        {
-            profiles.push(profile);
-        }
-        profiles
-    }
-
-    /// Looks up the profile keyed on `request_model` (exact, then
-    /// case-insensitive), already `extends`-resolved.
+    /// Looks up the profile keyed on `request_model` (exact, then trimmed
+    /// case-insensitive), already `extends`-resolved. Exact-key match only - a
+    /// glob key matches only when `request_model` equals the pattern verbatim;
+    /// use `resolve_route` for glob-aware routing.
     pub fn model_profile(&self, request_model: &str) -> Option<&ModelProfile> {
-        self.model_profiles.get(request_model).or_else(|| {
-            self.model_profiles
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(request_model))
-                .map(|(_, profile)| profile)
-        })
+        let key = request_model.trim();
+        self.model_profiles
+            .iter()
+            .find(|cp| cp.key.trim() == key)
+            .or_else(|| {
+                self.model_profiles
+                    .iter()
+                    .find(|cp| cp.key.trim().eq_ignore_ascii_case(key))
+            })
+            .map(|cp| &cp.profile)
     }
+}
+
+/// The effective backend model a profile serves: `upstream_model` when set,
+/// else the profile key. This is the id the leaf POSTs, so the leaf's per-model
+/// policies are keyed by it.
+fn effective_backend_model(cp: &CompiledProfile) -> String {
+    cp.profile
+        .upstream_model
+        .clone()
+        .unwrap_or_else(|| cp.key.clone())
+}
+
+/// Build the EXACT leaf-policy map: for every profile whose effective backend
+/// model is a FIXED id the leaf POSTs - a non-glob profile, or a glob profile
+/// that pins `upstream_model` - register `extract(profile)` under that id. First
+/// registration wins on a key collision, matching declaration-order precedence.
+fn build_exact_policies<V>(
+    profiles: &[CompiledProfile],
+    extract: impl Fn(&ModelProfile) -> Option<V>,
+) -> BTreeMap<String, V> {
+    let mut map = BTreeMap::new();
+    for cp in profiles {
+        // A glob profile with no `upstream_model` serves the passthrough request
+        // model, so it is matched by pattern, not by a fixed exact id.
+        if cp.glob.is_some() && cp.profile.upstream_model.is_none() {
+            continue;
+        }
+        if let Some(value) = extract(&cp.profile) {
+            map.entry(effective_backend_model(cp)).or_insert(value);
+        }
+    }
+    map
+}
+
+/// Build the GLOB leaf-policy list, in declaration order, for glob profiles that
+/// have NO `upstream_model` (their POSTed id is the passthrough request model,
+/// so the compiled pattern matches it). Glob profiles that pin `upstream_model`
+/// serve a fixed id and are exact entries via [`build_exact_policies`] instead.
+fn build_glob_policies<V>(
+    profiles: &[CompiledProfile],
+    extract: impl Fn(&ModelProfile) -> Option<V>,
+) -> Vec<(Regex, V)> {
+    profiles
+        .iter()
+        .filter_map(|cp| {
+            let glob = cp.glob.clone()?;
+            if cp.profile.upstream_model.is_some() {
+                return None;
+            }
+            extract(&cp.profile).map(|value| (glob, value))
+        })
+        .collect()
+}
+
+/// Compile a profile's resolved reasoning-effort config into a leaf policy, or
+/// `None` when the profile carries no effort map / typed syntax. Both the
+/// fragment-based map and the upstream-compatible typed shorthand fold into the
+/// same policy.
+fn reasoning_effort_policy_of(profile: &ModelProfile) -> Option<ReasoningEffortPolicy> {
+    if profile.reasoning_effort_map.is_empty() && profile.reasoning_effort.is_none() {
+        return None;
+    }
+    let (map, default, upstream_reasoning) = if let Some(reasoning) = &profile.reasoning_effort {
+        let mut map: BTreeMap<String, JsonValue> = reasoning
+            .map
+            .iter()
+            .map(|(level, mapped)| {
+                (
+                    level.trim().to_ascii_lowercase(),
+                    serde_json::json!({"reasoning_effort": mapped}),
+                )
+            })
+            .collect();
+        let default =
+            trim_nonempty(reasoning.default.as_deref()).map(|level| level.to_ascii_lowercase());
+        // Upstream semantics do not run the configured default back through
+        // `map`: the default is emitted verbatim.
+        if let Some(level) = &default {
+            map.insert(
+                level.clone(),
+                serde_json::json!({"reasoning_effort": level}),
+            );
+        }
+        (map, default, Some(reasoning.clone()))
+    } else {
+        (
+            profile
+                .reasoning_effort_map
+                .iter()
+                .map(|(level, fragment)| (level.trim().to_ascii_lowercase(), fragment.clone()))
+                .collect(),
+            trim_nonempty(profile.reasoning_effort_default.as_deref())
+                .map(|level| level.to_ascii_lowercase()),
+            None,
+        )
+    };
+    Some(ReasoningEffortPolicy {
+        map,
+        default,
+        upstream_reasoning,
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1886,7 +2043,9 @@ struct ResolvedModelProfile {
 impl ResolvedModelProfile {
     fn into_model_profile(self) -> ModelProfile {
         ModelProfile {
-            upstream: self.upstream,
+            // Empty when no profile/template in the chain set it; validated as
+            // required (non-empty) in `validate_model_profiles`.
+            upstream: self.upstream.unwrap_or_default(),
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
             roles: self.roles,
@@ -1963,8 +2122,8 @@ pub(crate) fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
 
 /// Compile a persisted key into a case-insensitive glob matcher, or `None` for
 /// a literal key matched by exact (trimmed, case-insensitive) comparison
-/// instead. Shared glob-compilation entry point for `model_routes` today, and
-/// (from Task 5) `model_profiles`, so both keep exactly one glob truth.
+/// instead. Shared glob-compilation entry point for both `model_routes` and
+/// `model_profiles`, so both keep exactly one glob truth.
 pub fn compile_model_glob(pattern: &str) -> Result<Option<Regex>, String> {
     if is_glob_pattern(pattern) {
         Ok(Some(glob_to_regex(pattern)?))
@@ -1976,8 +2135,8 @@ pub fn compile_model_glob(pattern: &str) -> Result<Option<Regex>, String> {
 fn resolve_model_profiles(
     profiles: &OrderedModelProfiles,
     templates: &BTreeMap<String, PersistedModelProfile>,
-) -> Result<BTreeMap<String, ModelProfile>, String> {
-    let mut resolved = BTreeMap::new();
+) -> Result<Vec<CompiledProfile>, String> {
+    let mut resolved = Vec::with_capacity(profiles.0.len());
     for (name, profile) in &profiles.0 {
         let name = name.trim();
         if name.is_empty() {
@@ -1999,9 +2158,105 @@ fn resolve_model_profiles(
                 "model_profiles[{name}]: `reasoning_effort` cannot be combined with `reasoning_effort_map` or `reasoning_effort_default`"
             ));
         }
-        resolved.insert(name.to_string(), profile);
+        let glob =
+            compile_model_glob(name).map_err(|err| format!("model_profiles[{name}]: {err}"))?;
+        resolved.push(CompiledProfile {
+            key: name.to_string(),
+            glob,
+            profile,
+        });
     }
     Ok(resolved)
+}
+
+/// Cross-reference validation for the resolved profiles, run after both the
+/// upstreams and the profile chain are built. Applies to ALL profiles including
+/// glob-keyed ones and the `*` catch-all: `upstream` is required and must name a
+/// known endpoint; each fallback must name a known endpoint distinct from the
+/// primary with no duplicates; an `image_analysis` redirect must target an
+/// existing EXACT-key profile that is neither the profile itself, a glob, nor a
+/// profile that itself declares `image_analysis`.
+fn validate_model_profiles(
+    profiles: &[CompiledProfile],
+    upstreams: &[UpstreamConfig],
+) -> Result<(), String> {
+    let upstream_known = |name: &str| {
+        upstreams
+            .iter()
+            .any(|u| u.name.trim().eq_ignore_ascii_case(name.trim()))
+    };
+    for cp in profiles {
+        let key = cp.key.as_str();
+        let profile = &cp.profile;
+        let primary = profile.upstream.trim();
+        if primary.is_empty() {
+            return Err(format!("model_profiles[{key}]: `upstream` is required"));
+        }
+        if !upstream_known(primary) {
+            return Err(format!(
+                "model_profiles[{key}]: unknown upstream {:?}",
+                profile.upstream
+            ));
+        }
+        let mut seen = HashSet::new();
+        for fallback in &profile.fallbacks {
+            let name = fallback.upstream.trim();
+            if name.eq_ignore_ascii_case(primary) {
+                return Err(format!(
+                    "model_profiles[{key}]: fallback {:?} is the primary upstream",
+                    fallback.upstream
+                ));
+            }
+            if !upstream_known(name) {
+                return Err(format!(
+                    "model_profiles[{key}]: unknown upstream {:?} in fallbacks",
+                    fallback.upstream
+                ));
+            }
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(format!(
+                    "model_profiles[{key}]: duplicate fallback upstream {:?}",
+                    fallback.upstream
+                ));
+            }
+        }
+        if let Some(image_analysis) = &profile.image_analysis {
+            let target = image_analysis.model.trim();
+            if target.eq_ignore_ascii_case(key.trim()) {
+                return Err(format!(
+                    "model_profiles[{key}]: image_analysis cannot redirect to itself"
+                ));
+            }
+            let exact_target = profiles.iter().find(|other| {
+                other.glob.is_none() && other.key.trim().eq_ignore_ascii_case(target)
+            });
+            match exact_target {
+                Some(other) if other.profile.image_analysis.is_some() => {
+                    return Err(format!(
+                        "model_profiles[{key}]: image_analysis target {:?} itself sets image_analysis",
+                        image_analysis.model
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    let glob_target = profiles.iter().any(|other| {
+                        other.glob.is_some() && other.key.trim().eq_ignore_ascii_case(target)
+                    });
+                    if glob_target {
+                        return Err(format!(
+                            "model_profiles[{key}]: image_analysis target {:?} is a glob profile",
+                            image_analysis.model
+                        ));
+                    }
+                    return Err(format!(
+                        "model_profiles[{key}]: unknown image_analysis target {:?}",
+                        image_analysis.model
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_persisted_model_profile(
@@ -2622,6 +2877,7 @@ mod tests {
     fn resolves_reasoning_effort_policy_from_profile_chain() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
 model_profile_templates:
   glm-effort:
     reasoning_effort_default: max
@@ -2631,6 +2887,7 @@ model_profile_templates:
       none: { chat_template_kwargs: { enable_thinking: false } }
 model_profiles:
   GLM-5.2-NVFP4-MTP:
+    upstream: backend
     extends: [glm-effort]
     reasoning_effort_map:
       xhigh: { chat_template_kwargs: { reasoning_effort: max } }
@@ -2664,8 +2921,10 @@ model_profiles:
     fn upstream_reasoning_syntax_uses_leaf_resolution_and_dynamic_thinking_kwarg() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
 model_profiles:
   served-model:
+    upstream: backend
     reasoning_effort:
       default: medium
       map:
@@ -2839,6 +3098,7 @@ model_profiles:
                 upstream_model: None,
                 fallback_upstreams: None,
             }],
+            model_profiles: OrderedModelProfiles::default(),
             ..PersistedConfig::default()
         };
 
@@ -2926,6 +3186,7 @@ model_profiles:
                     fallback_upstreams: None,
                 },
             ],
+            model_profiles: OrderedModelProfiles::default(),
             ..PersistedConfig::default()
         };
         let result = Config::from_persisted(&config).expect("config");
@@ -3139,7 +3400,7 @@ model_profiles:
                     "global_only": true
                 }),
             )]),
-            upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
             fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
@@ -3147,6 +3408,7 @@ model_profiles:
                 "Reasoner-A26".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
+                    upstream: Some("backend".to_string()),
                     upstream_model: None,
                     system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::from_iter([(
@@ -3218,9 +3480,25 @@ model_profiles:
         );
     }
 
-    /// Build a `PersistedModelProfile` with only a `template_family` set.
+    /// A single named `backend` upstream, so profile tests that only exercise
+    /// shaping still satisfy the required `upstream` reference.
+    fn backend_upstreams() -> Vec<PersistedUpstream> {
+        vec![PersistedUpstream {
+            name: "backend".to_string(),
+            url: "http://h/v1".to_string(),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
+            upstream_model: None,
+            fallback_upstreams: None,
+        }]
+    }
+
+    /// Build a `PersistedModelProfile` with only a `template_family` set (plus
+    /// the required `upstream`, satisfied by the default `default` endpoint).
     fn profile_with_family(family: &str) -> PersistedModelProfile {
         PersistedModelProfile {
+            upstream: Some("default".to_string()),
             template_family: Some(family.to_string()),
             native_vision: None,
             ..PersistedModelProfile::default()
@@ -3264,6 +3542,84 @@ model_profiles:
         assert_eq!(
             leaf_family_kwargs(&config, "plain-model"),
             json!({"enable_thinking": true})
+        );
+    }
+
+    /// A GLOB profile with no `upstream_model` serves the passthrough request
+    /// model, so its leaf policy is found by pattern-matching the POSTed id.
+    #[test]
+    fn leaf_finds_glob_policy_by_pattern_without_upstream_model() {
+        let config = Config::from_persisted(
+            &serde_yaml::from_str(
+                r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
+model_profiles:
+  "router-*": { upstream: backend, template_family: kimi }
+"#,
+            )
+            .unwrap(),
+        )
+        .expect("config");
+        // The POSTed id `router-7` matches the `router-*` pattern at the leaf.
+        assert_eq!(
+            leaf_family_kwargs(&config, "router-7"),
+            json!({"thinking": true, "preserve_thinking": true})
+        );
+    }
+
+    /// A GLOB profile that pins `upstream_model` serves that FIXED id, so its
+    /// leaf policy is registered as an EXACT entry under the served id (not in
+    /// the glob list). Looking up the served id finds it; the pattern itself is
+    /// never POSTed for such a profile and must NOT resolve a policy.
+    #[test]
+    fn leaf_finds_glob_with_upstream_model_by_served_id_not_pattern() {
+        let config = Config::from_persisted(
+            &serde_yaml::from_str(
+                r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
+model_profiles:
+  "alias-*": { upstream: backend, upstream_model: backend-fixed, template_family: kimi }
+"#,
+            )
+            .unwrap(),
+        )
+        .expect("config");
+        // The leaf POSTs the pinned `backend-fixed`; the exact registration hits.
+        assert_eq!(
+            leaf_family_kwargs(&config, "backend-fixed"),
+            json!({"thinking": true, "preserve_thinking": true})
+        );
+        // The pattern is NOT in the glob list, so a would-be `alias-*` POST id
+        // resolves no policy (it is never actually POSTed for this profile).
+        assert!(!leaf_request_has_family_kwargs(&config, "alias-9"));
+    }
+
+    /// An EXACT profile entry beats a matching GLOB entry at the leaf.
+    #[test]
+    fn leaf_exact_policy_beats_matching_glob_policy() {
+        let config = Config::from_persisted(
+            &serde_yaml::from_str(
+                r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
+model_profiles:
+  "served-x": { upstream: backend, template_family: deepseek }
+  "served-*": { upstream: backend, template_family: kimi }
+"#,
+            )
+            .unwrap(),
+        )
+        .expect("config");
+        // `served-x` has an exact entry (deepseek), which wins over the matching
+        // `served-*` glob (kimi).
+        assert_eq!(
+            leaf_family_kwargs(&config, "served-x"),
+            json!({"enable_thinking": true})
+        );
+        // A non-exact id still falls through to the glob (kimi), proving the
+        // glob entry is present and only loses to the exact match.
+        assert_eq!(
+            leaf_family_kwargs(&config, "served-9"),
+            json!({"thinking": true, "preserve_thinking": true})
         );
     }
 
@@ -3315,7 +3671,7 @@ model_profiles:
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
             fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
@@ -3323,6 +3679,7 @@ model_profiles:
                 "MiMo-V2.5".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
+                    upstream: Some("backend".to_string()),
                     upstream_model: Some("mimo-v2.5".to_string()),
                     system_prompt_prefix: Some("Prefer concise answers.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
@@ -3364,9 +3721,9 @@ model_profiles:
         })
         .expect("config");
 
-        // The LEAF's `policy_for_model` matches the profile keyed `MiMo-V2.5`
-        // against the FINAL backend model `mimo-v2.5` via canonical key (case-
-        // insensitive), surfacing that profile's `upstream_chat_kwargs`.
+        // The profile keyed `MiMo-V2.5` sets `upstream_model: mimo-v2.5`, so the
+        // leaf keys its `upstream_chat_kwargs` by that effective backend model
+        // and surfaces them for the FINAL backend `mimo-v2.5` on an exact match.
         assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "mimo-v2.5");
         assert_eq!(
             leaf_chat_kwargs(&config, "mimo-v2.5"),
@@ -3399,7 +3756,7 @@ model_profiles:
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
             fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
@@ -3408,6 +3765,7 @@ model_profiles:
                     "xiaomi/mimo-v2.5-pro".to_string(),
                     PersistedModelProfile {
                         extends: Vec::new(),
+                        upstream: Some("backend".to_string()),
                         upstream_model: None,
                         system_prompt_prefix: Some("Backend prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
@@ -3426,6 +3784,7 @@ model_profiles:
                     "client-default-model".to_string(),
                     PersistedModelProfile {
                         extends: Vec::new(),
+                        upstream: Some("backend".to_string()),
                         upstream_model: None,
                         system_prompt_prefix: Some("Client prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
@@ -3509,7 +3868,7 @@ model_profiles:
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
             fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
@@ -3518,7 +3877,7 @@ model_profiles:
                     "MiMo-V2.5".to_string(),
                     PersistedModelProfile {
                         extends: Vec::new(),
-                        upstream_model: Some("upper-profile".to_string()),
+                        upstream: Some("backend".to_string()),
                         system_prompt_prefix: Some("Upper prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
@@ -3533,7 +3892,7 @@ model_profiles:
                     "mimo-v2.5".to_string(),
                     PersistedModelProfile {
                         extends: Vec::new(),
-                        upstream_model: Some("lower-profile".to_string()),
+                        upstream: Some("backend".to_string()),
                         system_prompt_prefix: Some("Lower prefix.".to_string()),
                         upstream_chat_kwargs: JsonMap::from_iter([(
                             "stream_reasoning".to_string(),
@@ -3569,11 +3928,15 @@ model_profiles:
         })
         .expect("config");
 
-        assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "lower-profile");
-        // The LEAF's `policy_for_model` prefers the EXACT-id profile over the
-        // case-insensitive (canonical-key) sibling: for FINAL backend `mimo-v2.5`
-        // the lowercase profile (`false`) wins over `MiMo-V2.5` (`true`), even
-        // though both share a canonical key.
+        // `resolve_route` prefers the EXACT-case key over its case-insensitive
+        // sibling: with no `upstream_model`, the served model is the matched key
+        // itself, so the lowercase profile wins for `mimo-v2.5`.
+        assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "mimo-v2.5");
+        // The LEAF keys per-model policies by the effective backend model (here
+        // the profile key, since neither sets `upstream_model`) and prefers the
+        // EXACT-id entry over its canonical-key sibling: for FINAL backend
+        // `mimo-v2.5` the lowercase profile (`false`) wins over `MiMo-V2.5`
+        // (`true`), even though both share a canonical key.
         assert_eq!(
             leaf_chat_kwargs(&config, "mimo-v2.5"),
             JsonMap::from_iter([("stream_reasoning".to_string(), JsonValue::Bool(false))])
@@ -3592,6 +3955,7 @@ model_profiles:
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
+                    upstream: Some("default".to_string()),
                     upstream_model: None,
                     system_prompt_prefix: Some("Profile prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::new(),
@@ -3682,6 +4046,7 @@ model_profiles:
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming".to_string()],
+                    upstream: Some("default".to_string()),
                     upstream_model: None,
                     system_prompt_prefix: Some("Model prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::from_iter([
@@ -3748,6 +4113,7 @@ model_profiles:
     fn model_profile_shorthand_kwargs_merge_with_explicit_wrapper() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             r#"
+upstreams: [{ name: backend, url: "http://h/v1" }]
 model_profile_templates:
   reasoning:
     separate_reasoning: true
@@ -3756,6 +4122,7 @@ model_profile_templates:
 
 model_profiles:
   Reasoner-D4:
+    upstream: backend
     extends:
       - reasoning
     stream_reasoning: true
@@ -3986,7 +4353,7 @@ model_profiles:
             upstream_request_log_path: None,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
-            upstreams: Vec::new(),
+            upstreams: backend_upstreams(),
             fallback_upstreams: None,
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
@@ -3994,6 +4361,7 @@ model_profiles:
                 "anthropic/Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
+                    upstream: Some("backend".to_string()),
                     upstream_model: Some("anthropic-custom".to_string()),
                     upstream_chat_kwargs: JsonMap::new(),
                     system_prompt_prefix: None,
@@ -4040,6 +4408,7 @@ model_profiles:
         let config = Config::from_persisted(&PersistedConfig {
             upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
             upstreams: Vec::new(),
+            model_profiles: OrderedModelProfiles::default(),
             ..PersistedConfig::default()
         })
         .expect("config");
@@ -4070,6 +4439,7 @@ model_profiles:
                 upstream_model: None,
                 fallback_upstreams: None,
             }],
+            model_profiles: OrderedModelProfiles::default(),
             ..PersistedConfig::default()
         })
         .expect("config");
@@ -4097,6 +4467,7 @@ model_profiles:
             upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             upstreams: Vec::new(),
+            model_profiles: OrderedModelProfiles::default(),
             ..PersistedConfig::default()
         })
         .expect("config");
@@ -4128,6 +4499,7 @@ model_profiles:
                 upstream_model: None,
                 fallback_upstreams: None,
             }],
+            model_profiles: OrderedModelProfiles::default(),
             ..PersistedConfig::default()
         })
         .expect("config");
@@ -4148,6 +4520,7 @@ model_profiles:
             upstream_request_log_path: Some("/tmp/llmconduit-shared/requests.jsonl".to_string()),
             turn_capture_dir: Some("/tmp/llmconduit-shared".to_string()),
             upstreams: Vec::new(),
+            model_profiles: OrderedModelProfiles::default(),
             ..PersistedConfig::default()
         })
         .expect("config");

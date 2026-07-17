@@ -495,7 +495,7 @@ pub fn test_config() -> Config {
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
-        model_profiles: BTreeMap::new(),
+        model_profiles: Vec::new(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),

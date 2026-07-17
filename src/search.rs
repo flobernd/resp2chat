@@ -253,7 +253,7 @@ mod tests {
                 upstreams: Vec::new(),
                 fallback_upstreams: Vec::new(),
                 upstream_failure_cooldown_secs: 30,
-                model_profiles: std::collections::BTreeMap::new(),
+                model_profiles: Vec::new(),
                 model_routes: Vec::new(),
                 template_family: None,
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1")
@@ -304,7 +304,7 @@ mod tests {
                 upstreams: Vec::new(),
                 fallback_upstreams: Vec::new(),
                 upstream_failure_cooldown_secs: 30,
-                model_profiles: std::collections::BTreeMap::new(),
+                model_profiles: Vec::new(),
                 model_routes: Vec::new(),
                 template_family: None,
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1/")

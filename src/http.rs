@@ -1357,10 +1357,8 @@ async fn handle_count_tokens(
     let original_model = request.model.clone();
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
-    let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
-    let roles = gateway
-        .config()
-        .resolve_roles_config_for_resolved_model(&original_model, &resolved_model);
+    let responses_request = gateway.apply_system_prompt_prefix(responses_request);
+    let roles = gateway.config().resolve_roles_config(&original_model);
     let lowered = responses_to_chat::lower_request_with_image_agent_and_roles(
         &responses_request,
         Vec::new(),

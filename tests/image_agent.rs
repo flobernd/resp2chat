@@ -1387,15 +1387,16 @@ async fn image_agent_strips_when_kimi_alias_remaps_to_text_backend() {
         .await;
     let mut config = image_agent_config();
     // Profile on the request alias remaps to a text backend via upstream_model.
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "kimi-fast".to_string(),
-        llmconduit::config::ModelProfile {
+    config.model_profiles = vec![llmconduit::config::CompiledProfile {
+        key: "kimi-fast".to_string(),
+        glob: None,
+        profile: llmconduit::config::ModelProfile {
             upstream_model: Some("deepseek-v3".to_string()),
             system_prompt_prefix: None,
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
         },
-    )]);
+    }];
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     request.model = "kimi-fast".to_string();
