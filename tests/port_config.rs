@@ -343,6 +343,48 @@ model_profiles:
 }
 
 #[test]
+fn image_analysis_defaults_max_tokens_and_max_rounds_when_omitted() {
+    let yaml = "upstreams:\n  - { name: l, url: \"http://h/v1\" }\n  - { name: v, url: \"http://v/v1\" }\nmodel_profiles:\n  M:\n    upstream: l\n    image_analysis: { model: V }\n  V:\n    upstream: v\n";
+    let config = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap();
+    let image_analysis = config
+        .model_profile("M")
+        .expect("profile")
+        .image_analysis
+        .clone()
+        .expect("image_analysis");
+    assert_eq!(image_analysis.max_tokens, 8192);
+    assert_eq!(image_analysis.max_rounds, 8);
+}
+
+#[test]
+fn image_analysis_honors_explicit_max_tokens_and_max_rounds() {
+    let yaml = "upstreams:\n  - { name: l, url: \"http://h/v1\" }\n  - { name: v, url: \"http://v/v1\" }\nmodel_profiles:\n  M:\n    upstream: l\n    image_analysis: { model: V, max_tokens: 16384, max_rounds: 3 }\n  V:\n    upstream: v\n";
+    let config = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap();
+    let image_analysis = config
+        .model_profile("M")
+        .expect("profile")
+        .image_analysis
+        .clone()
+        .expect("image_analysis");
+    assert_eq!(image_analysis.max_tokens, 16384);
+    assert_eq!(image_analysis.max_rounds, 3);
+}
+
+#[test]
+fn image_analysis_zero_max_tokens_is_a_startup_error_naming_the_profile() {
+    let yaml = "upstreams:\n  - { name: l, url: \"http://h/v1\" }\n  - { name: v, url: \"http://v/v1\" }\nmodel_profiles:\n  M:\n    upstream: l\n    image_analysis: { model: V, max_tokens: 0 }\n  V:\n    upstream: v\n";
+    let err = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap_err();
+    assert!(err.contains('M') && err.contains("max_tokens"), "{err}");
+}
+
+#[test]
+fn image_analysis_zero_max_rounds_is_a_startup_error_naming_the_profile() {
+    let yaml = "upstreams:\n  - { name: l, url: \"http://h/v1\" }\n  - { name: v, url: \"http://v/v1\" }\nmodel_profiles:\n  M:\n    upstream: l\n    image_analysis: { model: V, max_rounds: 0 }\n  V:\n    upstream: v\n";
+    let err = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap_err();
+    assert!(err.contains('M') && err.contains("max_rounds"), "{err}");
+}
+
+#[test]
 fn profile_native_vision_is_a_startup_error() {
     let yaml = "upstreams: [{ name: l, url: \"http://h/v1\" }]\nmodel_profiles:\n  M: { upstream: l, native_vision: true }\n";
     let err = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap_err();

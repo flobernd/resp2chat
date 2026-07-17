@@ -316,6 +316,8 @@ pub fn image_analysis_config(residual: llmconduit::config::ResidualImagePolicy) 
         image_analysis: Some(llmconduit::config::ImageAnalysisConfig {
             model: "analyzer".to_string(),
             residual_images: residual,
+            max_tokens: 8192,
+            max_rounds: 8,
         }),
         ..llmconduit::config::ModelProfile::default()
     };
@@ -331,6 +333,24 @@ pub fn image_analysis_config(residual: llmconduit::config::ResidualImagePolicy) 
             profile: llmconduit::config::ModelProfile::default(),
         },
     ];
+    config
+}
+
+/// Like [`image_analysis_config`] but with explicit `max_tokens`/`max_rounds`,
+/// for tests asserting the analyzer budget/round-cap wiring rather than the
+/// defaults.
+pub fn image_analysis_config_with_limits(
+    residual: llmconduit::config::ResidualImagePolicy,
+    max_tokens: u64,
+    max_rounds: usize,
+) -> Config {
+    let mut config = image_analysis_config(residual);
+    for compiled in &mut config.model_profiles {
+        if let Some(image_analysis) = compiled.profile.image_analysis.as_mut() {
+            image_analysis.max_tokens = max_tokens;
+            image_analysis.max_rounds = max_rounds;
+        }
+    }
     config
 }
 

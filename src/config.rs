@@ -810,6 +810,15 @@ pub struct ImageAnalysisConfig {
     pub model: String,
     #[serde(default)]
     pub residual_images: ResidualImagePolicy,
+    /// Analyzer completion budget. A thinking-enabled analyzer can spend the
+    /// whole budget on reasoning before emitting content, surfacing as a
+    /// missing-content analyzer error; raise this for such models.
+    #[serde(default = "default_image_analysis_max_tokens")]
+    pub max_tokens: u64,
+    /// Per-turn cap on `analyzeImage` rounds, so a model that keeps
+    /// re-requesting analysis still terminates.
+    #[serde(default = "default_image_analysis_max_rounds")]
+    pub max_rounds: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Default)]
@@ -1254,6 +1263,14 @@ fn default_connect_timeout_secs() -> u64 {
 
 fn default_max_web_search_rounds() -> usize {
     5
+}
+
+fn default_image_analysis_max_tokens() -> u64 {
+    8192
+}
+
+fn default_image_analysis_max_rounds() -> usize {
+    8
 }
 
 fn default_flatten_content() -> bool {
@@ -2033,7 +2050,8 @@ fn resolve_model_profiles(
 /// known endpoint; each fallback must name a known endpoint distinct from the
 /// primary with no duplicates; an `image_analysis` redirect must target an
 /// existing EXACT-key profile that is neither the profile itself, a glob, nor a
-/// profile that itself declares `image_analysis`.
+/// profile that itself declares `image_analysis`; `image_analysis.max_tokens`
+/// and `.max_rounds` must both be non-zero.
 fn validate_model_profiles(
     profiles: &[CompiledProfile],
     upstreams: &[UpstreamConfig],
@@ -2079,6 +2097,16 @@ fn validate_model_profiles(
             }
         }
         if let Some(image_analysis) = &profile.image_analysis {
+            if image_analysis.max_tokens == 0 {
+                return Err(format!(
+                    "model_profiles[{key}]: image_analysis.max_tokens must not be 0"
+                ));
+            }
+            if image_analysis.max_rounds == 0 {
+                return Err(format!(
+                    "model_profiles[{key}]: image_analysis.max_rounds must not be 0"
+                ));
+            }
             let target = image_analysis.model.trim();
             if target.eq_ignore_ascii_case(key.trim()) {
                 return Err(format!(
