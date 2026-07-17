@@ -5,9 +5,8 @@
 //! This is the SINGLE place a [`ResponsesRequest`] is rewritten for the image
 //! agent. It runs BEFORE replay/lowering (`Gateway::stream_responses`) so replay
 //! hashes only ever see placeholder text, never image bytes. The `analyzeImage`
-//! tool schema and the gating predicate ([`latest_user_message_has_images`])
-//! that the engine consults to decide activation also live here, alongside the
-//! [`ImageCache::strip_and_cache_images`] method that ties them together.
+//! tool schema lives here alongside the [`ImageCache::strip_and_cache_images`]
+//! method that ties them together.
 
 use crate::models::responses::ContentItem;
 use crate::models::responses::ResponseItem;
@@ -98,11 +97,10 @@ impl ImageCache {
     /// renumbered consistently; the cache is cleared first so numbering resets
     /// per request exactly like claude-relay's stateless processing.
     ///
-    /// `gate` decides activation: the caller must have already confirmed the
-    /// latest user turn has images and the backend is not native-vision. We
-    /// renumber every user-message image (not just the latest) because the
-    /// history the client resends still contains earlier raw images that would
-    /// otherwise leak bytes upstream.
+    /// The engine only calls this once it has decided the image agent is active
+    /// for the turn. We renumber every user-message image (not just the latest)
+    /// because the history the client resends still contains earlier raw images
+    /// that would otherwise leak bytes upstream.
     pub fn strip_and_cache_images(&self, request: &mut ResponsesRequest, session_id: &str) {
         self.clear_session(session_id);
         let mut counter = 1usize;
@@ -199,32 +197,6 @@ fn prepend_image_agent_system_prompt(request: &mut ResponsesRequest) {
     };
 }
 
-/// Whether the LATEST user message in the canonical input carries at least one
-/// `InputImage` with a usable `image_url`. Only the latest user turn activates
-/// the agent (claude-relay's `has_images`): old images lingering in history must
-/// not re-trigger stripping/tool-injection.
-pub fn latest_user_message_has_images(input: &[ResponseItem]) -> bool {
-    let Some(content) = latest_user_message_content(input) else {
-        return false;
-    };
-    content.iter().any(|part| {
-        matches!(
-            part,
-            ContentItem::InputImage {
-                image_url: Some(url),
-                ..
-            } if !url.is_empty()
-        )
-    })
-}
-
-fn latest_user_message_content(input: &[ResponseItem]) -> Option<&[ContentItem]> {
-    input.iter().rev().find_map(|item| match item {
-        ResponseItem::Message { role, content, .. } if role == "user" => Some(content.as_slice()),
-        _ => None,
-    })
-}
-
 // ===========================================================================
 // E2b — residual-image safety pass.
 //
@@ -245,9 +217,7 @@ fn latest_user_message_content(input: &[ResponseItem]) -> Option<&[ContentItem]>
 /// not let reach a non-native-vision backend — ANY `InputImage`, regardless of
 /// whether `image_url`/`file_id` are populated, empty, or absent.
 ///
-/// Deliberately NOT gated on non-emptiness (unlike the G4 activation predicate
-/// [`latest_user_message_has_images`], which only cares whether there is a
-/// real image worth offloading): lowering (`content_item_to_chat_part`)
+/// Deliberately NOT gated on non-emptiness: lowering (`content_item_to_chat_part`)
 /// dispatches purely on the SHAPE of `InputImage` — `image_url: Some(_)`
 /// (even `Some("")`) still lowers to a `{"type":"image_url",...}` chat part,
 /// and `image_url: None` still lowers to `{"type":"input_image",...}`. A
@@ -391,44 +361,6 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "model": "glm-5.1" })).expect("request");
         req.input = input;
         req
-    }
-
-    #[test]
-    fn latest_user_detection_true_for_image_in_last_user() {
-        let input = vec![
-            user_with(vec![ContentItem::InputText { text: "hi".into() }]),
-            ResponseItem::message_text("assistant", "hello"),
-            user_with(vec![
-                ContentItem::InputText { text: "see".into() },
-                input_image("data:img"),
-            ]),
-        ];
-        assert!(latest_user_message_has_images(&input));
-    }
-
-    #[test]
-    fn latest_user_detection_false_for_only_old_images() {
-        let input = vec![
-            user_with(vec![input_image("data:old")]),
-            ResponseItem::message_text("assistant", "I saw it"),
-            user_with(vec![ContentItem::InputText {
-                text: "thanks".into(),
-            }]),
-        ];
-        assert!(!latest_user_message_has_images(&input));
-    }
-
-    #[test]
-    fn latest_user_detection_false_without_images_or_users() {
-        assert!(!latest_user_message_has_images(&[]));
-        let input = vec![ResponseItem::message_text("assistant", "hi")];
-        assert!(!latest_user_message_has_images(&input));
-        let empty_image = vec![user_with(vec![ContentItem::InputImage {
-            image_url: None,
-            file_id: Some("f".into()),
-            detail: None,
-        }])];
-        assert!(!latest_user_message_has_images(&empty_image));
     }
 
     #[test]

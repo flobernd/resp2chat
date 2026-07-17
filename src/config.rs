@@ -905,9 +905,10 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
 
         let raw = RawPersistedModelProfile::deserialize(deserializer)?;
         let mut upstream_chat_kwargs = raw.shorthand_upstream_chat_kwargs;
-        // `template_family`/`native_vision`/effort knobs are recognized profile
-        // fields, not chat-template shorthand kwargs, so drop any copy the
-        // `flatten` swept into the shorthand bucket (they live in typed fields).
+        // These keys all name recognized typed profile fields, not chat-template
+        // shorthand kwargs. serde's `flatten` copies them into the shorthand
+        // bucket alongside the typed fields, so strip the duplicates here; only
+        // genuinely unknown keys survive as shorthand kwargs.
         upstream_chat_kwargs.remove("template_family");
         upstream_chat_kwargs.remove("native_vision");
         upstream_chat_kwargs.remove("upstream");
@@ -2318,7 +2319,7 @@ fn parse_upstreams(entries: &[PersistedUpstream]) -> Result<Vec<UpstreamConfig>,
     Ok(upstreams)
 }
 
-/// Reject the legacy top-level knobs that profile routing replaced (Task 4).
+/// Reject the legacy top-level knobs that profile routing replaced.
 /// Each removed key is a HARD startup error naming the replacement rather than a
 /// silently-ignored value, so an upgraded config fails loud instead of behaving
 /// unexpectedly. Only one key needs reporting to send the operator to the README;

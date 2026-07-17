@@ -20,7 +20,7 @@
 //!   [`VisionRequest`], the parsed `analyzeImage` call with its cached images
 //!   resolved.
 //! - [`strip`] — request mutation: strip images to placeholders, inject the
-//!   `analyzeImage` tool + system prompt, and the activation predicate. Also
+//!   `analyzeImage` tool + system prompt. Also
 //!   home to the E2b role-agnostic residual-image pass
 //!   ([`degrade_residual_images`]/[`has_residual_images`]) that runs at the
 //!   engine layer when the image agent is active, so no raw `InputImage` reaches
@@ -43,7 +43,6 @@ pub use strip::analyze_image_tool_parameters;
 pub use strip::analyze_image_tool_spec;
 pub use strip::degrade_residual_images;
 pub use strip::has_residual_images;
-pub use strip::latest_user_message_has_images;
 pub use strip::tool_is_analyze_image;
 
 // Re-exported from the sibling redaction module so `crate::vision::redact_*`

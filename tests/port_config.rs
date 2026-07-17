@@ -287,6 +287,13 @@ fn upstream_entry_rejects_removed_keys_and_duplicates() {
             .expect_err("dup")
             .contains("duplicate upstream name")
     );
+    let blank = "upstreams:\n  - name: \"   \"\n    url: \"http://h/v1\"\n";
+    let persisted: PersistedConfig = serde_yaml::from_str(blank).expect("yaml");
+    assert!(
+        Config::from_persisted(&persisted)
+            .expect_err("blank name")
+            .contains("must not be blank")
+    );
 }
 
 #[test]

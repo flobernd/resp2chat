@@ -239,8 +239,9 @@ pub struct ProviderHealth {
     /// Epoch-ms instant this provider's `/v1/models` catalog was last fetched
     /// (`None` until the first refresh; only the routing client populates it).
     pub catalog_fetched_ms: Option<u64>,
-    /// Number of models in this provider's last catalog snapshot (`None` until
-    /// the first refresh; only the routing client populates it).
+    /// Number of models in the routing client's union catalog across all
+    /// upstreams (`None` until the first refresh; the same client-wide value is
+    /// stamped onto every provider, not a per-provider count).
     pub catalog_size: Option<u64>,
 }
 
@@ -690,8 +691,8 @@ impl UpstreamRequestLogger {
     async fn log(&self, request: &ChatCompletionRequest) -> std::io::Result<()> {
         // G4 round-4 #3: the JSONL request log is written to DISK and would
         // otherwise serialize raw `data:` image bytes / signed `image_url`s for
-        // native-vision-passthrough / disabled-agent / missing-url /
-        // tool_choice:"none" image requests (any path that does NOT strip). The
+        // any image request that reaches an upstream without stripping (e.g. a
+        // native-vision passthrough profile). The
         // common no-image request serializes directly (format unchanged); only
         // when the serialized bytes contain an image-URI marker do we re-redact
         // via a CLONED JSON value through the shared redactor, so the on-disk log
@@ -4077,8 +4078,8 @@ fn truncate_for_error(s: &str, max: usize) -> String {
 
 /// Redact image `data:`/signed URLs from an upstream RESPONSE error body, then
 /// truncate it for an `AppError`/log message (G4 round-9 #2). A provider that
-/// echoes a native-vision-passthrough / disabled-agent image request can mirror
-/// the submitted `data:` bytes or a signed image URL back in its 4xx/5xx body;
+/// echoes a native-vision passthrough image request can mirror the submitted
+/// `data:` bytes or a signed image URL back in its 4xx/5xx body;
 /// without this they would leak through `response.failed` and failover logs
 /// (AGENTS.md redact rule). Redaction runs BEFORE truncation so a split image
 /// URI cannot survive at the truncation boundary.

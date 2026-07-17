@@ -523,7 +523,7 @@ fn anthropic_reasoning_only_is_buffered_until_terminal_then_promoted_to_text() {
     );
 }
 
-/// Task 0B1: prove the conformance harness is reachable from THIS integration
+/// Prove the conformance harness is reachable from THIS integration
 /// crate at the public path `llmconduit::adapters::responses_to_anthropic::
 /// conformance`, operating on real `AnthropicStreamEvent`s the way the other
 /// tests in this file construct `AnthropicStreamConverter` output. Hand-built

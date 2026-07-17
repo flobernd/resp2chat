@@ -2526,7 +2526,7 @@ async fn lists_exact_profiles_as_openai_models() {
     apply_routing_yaml(
         &mut config,
         &format!(
-            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\nmodel_profiles:\n  glm-5.1:\n    upstream: primary\n  qwen3:\n    upstream: primary\n  \"*\":\n    upstream: primary\n",
+            "upstreams:\n  - name: primary\n    url: \"{}/v1/\"\nmodel_profiles:\n  qwen3:\n    upstream: primary\n  glm-5.1:\n    upstream: primary\n  \"*\":\n    upstream: primary\n",
             server.uri()
         ),
     );
@@ -2555,12 +2555,14 @@ async fn lists_exact_profiles_as_openai_models() {
         json!({
             "object": "list",
             "data": [
-                {"id": "glm-5.1", "object": "model", "owned_by": "llmconduit", "context_length": 131072},
-                {"id": "qwen3", "object": "model", "owned_by": "llmconduit"}
+                {"id": "qwen3", "object": "model", "owned_by": "llmconduit"},
+                {"id": "glm-5.1", "object": "model", "owned_by": "llmconduit", "context_length": 131072}
             ]
         }),
-        "exact profiles in declaration order; context_length only when the upstream \
-         catalog knows the served model; the glob catch-all is absent: {body}"
+        "exact profiles in DECLARATION order (qwen3 before glm-5.1, i.e. NOT \
+         alphabetical, so a sort regression fails here); context_length only \
+         when the upstream catalog knows the served model; the glob catch-all \
+         is absent: {body}"
     );
 }
 
@@ -6904,9 +6906,9 @@ fn chat_completion_sse_body(chunks: &[serde_json::Value]) -> String {
     body
 }
 
-/// Task 0B1: prove the conformance harness is reachable from THIS integration
+/// Prove the conformance harness is reachable from THIS integration
 /// crate at the public path `llmconduit::adapters::responses_to_anthropic::
-/// conformance` -- the same path later phases (C1-T5) will use together with
+/// conformance` -- the same path later phases will use together with
 /// `parse_anthropic_sse_events` to assert real `/v1/messages` SSE output.
 /// Hand-built JSON, NOT real converter output (the converter is not wired to
 /// the harness yet).
