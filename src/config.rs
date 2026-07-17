@@ -1367,6 +1367,7 @@ impl Config {
             load_default_persisted_config()?
         };
         apply_env_overrides(&mut persisted);
+        seed_upstream_api_keys_from_env(&mut persisted);
         Self::from_persisted(&persisted)
     }
 
@@ -2281,15 +2282,11 @@ fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<St
 /// routing target is now named by a model profile (see README "Migrating"),
 /// so an entry no longer carries its own `upstream_model` remap or nested
 /// `fallback_upstreams` chain -- those keys are detected here and rejected
-/// with the replacement they migrate to, rather than silently ignored.
+/// with the replacement they migrate to, rather than silently ignored. Reads
+/// only `entries`: any `OPENAI_API_KEY` seeding happens earlier, in the load
+/// path (`seed_upstream_api_keys_from_env`), so this stays a pure function of
+/// its input.
 fn parse_upstreams(entries: &[PersistedUpstream]) -> Result<Vec<UpstreamConfig>, String> {
-    // `OPENAI_API_KEY` seeds any entry that declares no `api_key` of its own, so
-    // the common single-endpoint setup authenticates from the environment without
-    // committing a secret to the config file (the top-level fallback this replaces
-    // is gone with the single-upstream knobs).
-    let openai_api_key = env::var("OPENAI_API_KEY")
-        .ok()
-        .and_then(|value| trim_nonempty(Some(&value)));
     let mut seen_names = HashSet::new();
     let mut upstreams = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
@@ -2317,7 +2314,7 @@ fn parse_upstreams(entries: &[PersistedUpstream]) -> Result<Vec<UpstreamConfig>,
         upstreams.push(UpstreamConfig {
             name: name.to_string(),
             url,
-            api_key: trim_nonempty(entry.api_key.as_deref()).or_else(|| openai_api_key.clone()),
+            api_key: trim_nonempty(entry.api_key.as_deref()),
             chat_kwargs: entry.chat_kwargs.clone(),
             request_log_path: trim_nonempty(entry.request_log_path.as_deref()).map(PathBuf::from),
         });
@@ -2469,6 +2466,30 @@ pub fn write_persisted_config(path: &Path, config: &PersistedConfig) -> Result<(
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     }
     Ok(())
+}
+
+/// Seeds the `api_key` of any `upstreams` entry that declares none of its own
+/// (blank counts as none) from `OPENAI_API_KEY`, so the common single-endpoint
+/// setup authenticates from the environment without committing a secret to
+/// the config file. Kept out of `Config::from_persisted` and applied only in
+/// the load path: a `from_persisted` that read env directly made every caller
+/// (including its own unit tests) sensitive to whatever `OPENAI_API_KEY`
+/// happened to be set in the process at the time, which is exactly the kind
+/// of ambient-state dependency that produces flaky tests and surprising
+/// behavior for callers that build a `Config` straight from a `PersistedConfig`
+/// value (issue #34).
+fn seed_upstream_api_keys_from_env(config: &mut PersistedConfig) {
+    let Some(openai_api_key) = env::var("OPENAI_API_KEY")
+        .ok()
+        .and_then(|value| trim_nonempty(Some(&value)))
+    else {
+        return;
+    };
+    for upstream in &mut config.upstreams {
+        if trim_nonempty(upstream.api_key.as_deref()).is_none() {
+            upstream.api_key = Some(openai_api_key.clone());
+        }
+    }
 }
 
 fn apply_env_overrides(config: &mut PersistedConfig) {
@@ -2629,6 +2650,7 @@ mod tests {
     use super::load_persisted_config;
     use super::merge_json_maps;
     use super::retain_finite_prices;
+    use super::seed_upstream_api_keys_from_env;
     use super::write_persisted_config;
     use crate::models::chat::ChatCompletionRequest;
     use crate::upstream::BackendChatRequest;
@@ -3030,16 +3052,57 @@ model_profiles:
         assert_eq!(result.unwrap(), PersistedConfig::default());
     }
 
+    /// `Config::from_persisted` must be a pure function of its input: it must
+    /// never read `OPENAI_API_KEY` (or any other ambient env var) itself, so a
+    /// caller building a `Config` directly from a `PersistedConfig` value gets
+    /// a result that depends only on that value, not on the process
+    /// environment at call time.
+    #[test]
+    fn from_persisted_is_pure_and_ignores_openai_api_key_env() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "must-not-leak-into-from-persisted");
+        }
+        let config = PersistedConfig {
+            upstreams: vec![PersistedUpstream {
+                name: "no-key".to_string(),
+                url: "http://127.0.0.1:8000/v1".to_string(),
+                api_key: None,
+                chat_kwargs: JsonMap::new(),
+                request_log_path: None,
+                upstream_model: None,
+                fallback_upstreams: None,
+            }],
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("no-key".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
+            ..PersistedConfig::default()
+        };
+        let result = Config::from_persisted(&config).expect("config");
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        assert_eq!(
+            result.upstreams[0].api_key, None,
+            "from_persisted must not seed api_key from OPENAI_API_KEY; that belongs to the load path"
+        );
+    }
+
     /// `OPENAI_API_KEY` seeds the api_key of any `upstreams` entry that declares
-    /// none of its own, resolved at `from_persisted` time; an entry with an
-    /// explicit key is left untouched.
+    /// none of its own, applied as a load-path mutation on `PersistedConfig`
+    /// (`seed_upstream_api_keys_from_env`) before `from_persisted` runs; an
+    /// entry with an explicit key is left untouched.
     #[test]
     fn openai_env_seeds_entries_without_an_explicit_api_key() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
         }
-        let config = PersistedConfig {
+        let mut config = PersistedConfig {
             upstreams: vec![
                 PersistedUpstream {
                     name: "no-key".to_string(),
@@ -3069,6 +3132,7 @@ model_profiles:
             )]),
             ..PersistedConfig::default()
         };
+        seed_upstream_api_keys_from_env(&mut config);
         let result = Config::from_persisted(&config).expect("config");
         unsafe {
             std::env::remove_var("OPENAI_API_KEY");
@@ -3082,6 +3146,50 @@ model_profiles:
             result.upstreams[1].api_key.as_deref(),
             Some("explicit"),
             "an entry with its own api_key is not overridden"
+        );
+    }
+
+    /// `Config::from_env_and_file` is the sole production entry point that
+    /// resolves a `Config` at startup, so this exercises the seed end to end
+    /// through it rather than through the extracted helper directly, proving
+    /// startup behavior is unchanged by moving the env read out of
+    /// `from_persisted`.
+    #[test]
+    fn from_env_and_file_seeds_openai_api_key_at_load_path() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "load-path-key-13579");
+        }
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-openai-seed-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &path,
+            "upstreams:\n\
+             \x20 - name: no-key\n\
+             \x20   url: \"http://127.0.0.1:8000/v1\"\n\
+             \x20 - name: own-key\n\
+             \x20   url: \"http://127.0.0.1:8001/v1\"\n\
+             \x20   api_key: explicit\n\
+             model_profiles:\n\
+             \x20 \"*\": { upstream: no-key }\n",
+        )
+        .expect("write yaml");
+        let result = Config::from_env_and_file(Some(&path)).expect("load config");
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        assert_eq!(
+            result.upstreams[0].api_key.as_deref(),
+            Some("load-path-key-13579"),
+            "startup seeds a keyless upstream entry from OPENAI_API_KEY"
+        );
+        assert_eq!(
+            result.upstreams[1].api_key.as_deref(),
+            Some("explicit"),
+            "an entry with its own api_key is not overridden at startup"
         );
     }
 
