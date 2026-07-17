@@ -31,9 +31,12 @@ mod common;
 use common::config_from_yaml;
 use common::test_config;
 use llmconduit::config::Config;
+use llmconduit::config::OrderedModelProfiles;
 use llmconduit::config::OrderedModelRoutes;
 use llmconduit::config::PersistedConfig;
+use llmconduit::config::PersistedModelProfile;
 use llmconduit::config::PersistedModelRoute;
+use llmconduit::config::compile_model_glob;
 use llmconduit::config::load_persisted_config;
 use llmconduit::config::parse_model_route_spec;
 use llmconduit::config::write_persisted_config;
@@ -655,4 +658,169 @@ model_profiles:
     let config = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap();
     assert_eq!(config.model_profile("A").unwrap().fallbacks.len(), 1);
     assert!(config.model_profile("B").unwrap().fallbacks.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `OrderedModelProfiles`: declaration order, duplicate-key collapse, round
+// trip, and the shared glob compiler (Task 3). Resolution against a glob
+// profile key lands in Task 5; this task only preserves the persisted shape.
+// ---------------------------------------------------------------------------
+
+/// Persisted `model_profiles` preserve DECLARATION order, not alphabetical
+/// order. `Zeta` sorts AFTER `Alpha` alphabetically, so a `BTreeMap` would
+/// reorder them; the ordered structure keeps file order. Mirrors
+/// `overlapping_glob_routes_preserve_declaration_order_not_alphabetical`.
+#[test]
+fn model_profiles_preserve_declaration_order_not_alphabetical() {
+    let zeta_first: PersistedConfig = serde_yaml::from_str(
+        r#"
+model_profiles:
+  Zeta:
+    upstream: z
+  Alpha:
+    upstream: a
+"#,
+    )
+    .expect("yaml");
+    let names: Vec<&str> = zeta_first
+        .model_profiles
+        .0
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Zeta", "Alpha"],
+        "declaration order must be preserved (a BTreeMap would sort Alpha first)"
+    );
+
+    // Reversed declaration => reversed resolved order.
+    let alpha_first: PersistedConfig = serde_yaml::from_str(
+        r#"
+model_profiles:
+  Alpha:
+    upstream: a
+  Zeta:
+    upstream: z
+"#,
+    )
+    .expect("yaml");
+    let names: Vec<&str> = alpha_first
+        .model_profiles
+        .0
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Alpha", "Zeta"]);
+}
+
+/// Duplicate profile keys collapse to last-wins (later value replaces the
+/// first, preserving the first position), matching `OrderedModelRoutes` and
+/// claude-relay dict semantics rather than keeping a shadowed first entry.
+#[test]
+fn duplicate_model_profile_keys_collapse_to_last_wins() {
+    let persisted: PersistedConfig = serde_yaml::from_str(
+        r#"
+model_profiles:
+  GLM-5.2:
+    upstream: first
+  GLM-5.2:
+    upstream: second
+"#,
+    )
+    .expect("yaml");
+
+    assert_eq!(
+        persisted.model_profiles.0.len(),
+        1,
+        "duplicate keys must collapse to a single profile"
+    );
+    let (name, profile) = &persisted.model_profiles.0[0];
+    assert_eq!(name, "GLM-5.2");
+    assert_eq!(
+        profile.upstream.as_deref(),
+        Some("second"),
+        "the later duplicate value must win"
+    );
+}
+
+/// `model_profiles` written by `write_persisted_config` reload through
+/// `load_persisted_config` as a MAP, preserving values AND declaration order.
+/// Mirrors `model_routes_round_trip_through_write_and_reload_as_map`.
+#[test]
+fn model_profiles_round_trip_through_write_and_reload_as_map() {
+    let config = PersistedConfig {
+        // Declared in non-alphabetical order to also lock order across the trip.
+        model_profiles: OrderedModelProfiles(vec![
+            (
+                "Zeta-Model".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("local".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "Alpha-Model".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("vl".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..PersistedConfig::default()
+    };
+
+    // The serialized form must be a MAP (`name: profile`), not a sequence.
+    let yaml = serde_yaml::to_string(&config).expect("serialize config");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+    assert!(
+        parsed["model_profiles"].is_mapping(),
+        "model_profiles must serialize as a YAML map, not a sequence:\n{yaml}"
+    );
+
+    let path = std::env::temp_dir().join(format!(
+        "llmconduit-t3-rt-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
+    write_persisted_config(&path, &config).expect("write config");
+    let reloaded = load_persisted_config(&path).expect("reload config");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        reloaded, config,
+        "profiles must round-trip through write + reload unchanged"
+    );
+    let names: Vec<&str> = reloaded
+        .model_profiles
+        .0
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Zeta-Model", "Alpha-Model"],
+        "declaration order must survive the round trip"
+    );
+}
+
+/// `compile_model_glob` compiles a case-insensitive matcher for a key holding
+/// any of `*?[`.
+#[test]
+fn compile_model_glob_matches_case_insensitively() {
+    let regex = compile_model_glob("claude-*")
+        .expect("valid glob")
+        .expect("glob pattern must compile a matcher");
+    assert!(regex.is_match("Claude-Opus-4"));
+}
+
+/// A literal key (no glob metacharacters) compiles to `None`, matched by exact
+/// comparison instead of a regex.
+#[test]
+fn compile_model_glob_returns_none_for_literal_key() {
+    assert!(
+        compile_model_glob("GLM-5.2")
+            .expect("literal key")
+            .is_none(),
+        "a literal key must not compile a glob matcher"
+    );
 }

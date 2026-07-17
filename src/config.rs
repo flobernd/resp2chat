@@ -1165,6 +1165,100 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
     }
 }
 
+/// Ordered set of persisted model profiles, keyed by request-model name.
+///
+/// A `Vec` of pairs rather than a `BTreeMap`, mirroring `OrderedModelRoutes`,
+/// so profile keys keep their DECLARATION order: a glob-capable profile key
+/// (Task 5) needs first-match-wins scanning when two globs overlap, and a
+/// `BTreeMap` would silently re-sort keys alphabetically. Both serde_yaml and
+/// the `toml` crate (with `preserve_order`) yield map entries in document
+/// order, so the file order is the resolution order.
+///
+/// It (de)serializes as a MAP (`name: profile`), not a sequence, so a config
+/// written by `write_persisted_config` round-trips back through the map
+/// deserializer; declaration order is preserved on write.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderedModelProfiles(pub Vec<(String, PersistedModelProfile)>);
+
+impl OrderedModelProfiles {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Insert a profile by name, replacing an existing entry IN PLACE
+    /// (preserving its position) or appending when the name is new. Collapses
+    /// duplicate keys to last-wins without disturbing declaration order.
+    ///
+    /// Name comparison is TRIMMED + ASCII-case-insensitive, identical to
+    /// `OrderedModelRoutes::upsert`. The replacing entry adopts the new name
+    /// (last value wins) but keeps the original position.
+    pub fn upsert(&mut self, name: String, profile: PersistedModelProfile) {
+        let key = name.trim();
+        if let Some(existing) = self
+            .0
+            .iter_mut()
+            .find(|(existing, _)| existing.trim().eq_ignore_ascii_case(key))
+        {
+            existing.0 = name;
+            existing.1 = profile;
+        } else {
+            self.0.push((name, profile));
+        }
+    }
+}
+
+impl Serialize for OrderedModelProfiles {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        // Emit as a MAP in declaration order so the written config reloads
+        // through `visit_map` (a sequence would not round-trip).
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, profile) in &self.0 {
+            map.serialize_entry(name, profile)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedModelProfiles {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ProfilesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ProfilesVisitor {
+            type Value = OrderedModelProfiles;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map of model-profile name to profile definition")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut profiles =
+                    OrderedModelProfiles(Vec::with_capacity(access.size_hint().unwrap_or(0)));
+                while let Some((name, profile)) =
+                    access.next_entry::<String, PersistedModelProfile>()?
+                {
+                    // Collapse duplicate keys to last-wins (replace in place),
+                    // matching `OrderedModelRoutes` and claude-relay dict
+                    // semantics, rather than keeping a shadowed first entry.
+                    profiles.upsert(name, profile);
+                }
+                Ok(profiles)
+            }
+        }
+
+        deserializer.deserialize_map(ProfilesVisitor)
+    }
+}
+
 /// A resolved fallback hop: the named `upstreams:` entry to try, plus an
 /// optional model-name remap for that hop.
 #[derive(Debug, Clone)]
@@ -1297,8 +1391,8 @@ pub struct PersistedConfig {
     pub upstream_failure_cooldown_secs: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_profile_templates: BTreeMap<String, PersistedModelProfile>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub model_profiles: BTreeMap<String, PersistedModelProfile>,
+    #[serde(default, skip_serializing_if = "OrderedModelProfiles::is_empty")]
+    pub model_profiles: OrderedModelProfiles,
     /// Ad-hoc model routes (G7): request-model name (possibly a glob) →
     /// synthetic upstream, in DECLARATION order (see `OrderedModelRoutes`). CLI
     /// `--model-route` specs are merged in after these.
@@ -1463,7 +1557,7 @@ impl Default for PersistedConfig {
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: default_upstream_failure_cooldown_secs(),
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::new(),
+            model_profiles: OrderedModelProfiles::default(),
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             brave_base_url: default_brave_base_url(),
@@ -2064,6 +2158,18 @@ pub(crate) fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
     Regex::new(&regex).map_err(|err| format!("invalid glob {pattern:?}: {err}"))
 }
 
+/// Compile a persisted key into a case-insensitive glob matcher, or `None` for
+/// a literal key matched by exact (trimmed, case-insensitive) comparison
+/// instead. Shared glob-compilation entry point for `model_routes` today, and
+/// (from Task 5) `model_profiles`, so both keep exactly one glob truth.
+pub fn compile_model_glob(pattern: &str) -> Result<Option<Regex>, String> {
+    if is_glob_pattern(pattern) {
+        Ok(Some(glob_to_regex(pattern)?))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Resolve persisted model routes into ordered `ModelRoute`s. A route with a
 /// blank key, a missing/invalid `upstream_base_url`, or an uncompilable glob is
 /// a clean startup error, never a panic. Order follows DECLARATION order (file
@@ -2080,11 +2186,8 @@ fn resolve_model_routes(routes: &OrderedModelRoutes) -> Result<Vec<ModelRoute>, 
             .ok_or_else(|| format!("model_routes[{name}]: missing upstream_base_url"))?;
         let upstream_base_url = Url::parse(&base_url)
             .map_err(|err| format!("model_routes[{name}]: invalid upstream_base_url: {err}"))?;
-        let glob = if is_glob_pattern(name) {
-            Some(glob_to_regex(name).map_err(|err| format!("model_routes[{name}]: {err}"))?)
-        } else {
-            None
-        };
+        let glob =
+            compile_model_glob(name).map_err(|err| format!("model_routes[{name}]: {err}"))?;
         resolved.push(ModelRoute {
             name: name.to_string(),
             glob,
@@ -2126,11 +2229,11 @@ pub fn parse_model_route_spec(spec: &str) -> Result<(String, PersistedModelRoute
 }
 
 fn resolve_model_profiles(
-    profiles: &BTreeMap<String, PersistedModelProfile>,
+    profiles: &OrderedModelProfiles,
     templates: &BTreeMap<String, PersistedModelProfile>,
 ) -> Result<BTreeMap<String, ModelProfile>, String> {
     let mut resolved = BTreeMap::new();
-    for (name, profile) in profiles {
+    for (name, profile) in &profiles.0 {
         let name = name.trim();
         if name.is_empty() {
             continue;
@@ -2667,6 +2770,7 @@ mod tests {
     use super::JsonMap;
     use super::JsonValue;
     use super::ModelPrice;
+    use super::OrderedModelProfiles;
     use super::OrderedModelRoutes;
     use super::PersistedConfig;
     use super::PersistedFallbackUpstream;
@@ -3418,7 +3522,7 @@ model_profiles:
                     ..Default::default()
                 },
             )]),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming-reasoning".to_string()],
@@ -3489,7 +3593,7 @@ model_profiles:
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "Reasoner-A26".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
@@ -3580,7 +3684,7 @@ model_profiles:
         // is what drives injection at the leaf.
         let config = Config::from_persisted(&PersistedConfig {
             template_family: Some("deepseek".to_string()),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "Router-X".to_string(),
                 profile_with_family("KIMI"),
             )]),
@@ -3665,7 +3769,7 @@ model_profiles:
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "MiMo-V2.5".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
@@ -3744,7 +3848,7 @@ model_profiles:
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "xiaomi/mimo-v2.5-pro".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
@@ -3829,7 +3933,7 @@ model_profiles:
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([
+            model_profiles: OrderedModelProfiles(vec![
                 (
                     "xiaomi/mimo-v2.5-pro".to_string(),
                     PersistedModelProfile {
@@ -3939,7 +4043,7 @@ model_profiles:
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([
+            model_profiles: OrderedModelProfiles(vec![
                 (
                     "MiMo-V2.5".to_string(),
                     PersistedModelProfile {
@@ -4014,7 +4118,7 @@ model_profiles:
     fn resolves_global_system_prompt_prefix_with_profile_prefix() {
         let config = Config::from_persisted(&PersistedConfig {
             system_prompt_prefix: Some("Global prefix.".to_string()),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
@@ -4104,7 +4208,7 @@ model_profiles:
                     },
                 ),
             ]),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["streaming".to_string()],
@@ -4220,7 +4324,7 @@ model_profiles:
     #[test]
     fn model_profiles_reject_unknown_template() {
         let error = Config::from_persisted(&PersistedConfig {
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["missing".to_string()],
@@ -4268,7 +4372,7 @@ model_profiles:
                     },
                 ),
             ]),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "GLM-5.1".to_string(),
                 PersistedModelProfile {
                     extends: vec!["a".to_string()],
@@ -4366,7 +4470,7 @@ model_profiles:
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::new(),
+            model_profiles: OrderedModelProfiles::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -4416,7 +4520,7 @@ model_profiles:
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
-            model_profiles: BTreeMap::from_iter([(
+            model_profiles: OrderedModelProfiles(vec![(
                 "anthropic/Kimi-K2.6".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
