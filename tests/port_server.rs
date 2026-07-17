@@ -490,12 +490,10 @@ async fn preflight_routing_caps_against_provider_context_window() {
     let mut config = config_for(&server.uri());
     config.upstreams = vec![llmconduit::config::UpstreamConfig {
         name: "routed".to_string(),
-        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        upstream_chat_kwargs: serde_json::Map::new(),
-        upstream_request_log_path: None,
-        fallback_upstreams: Vec::new(),
+        url: format!("{}/v1/", server.uri()).parse().expect("url"),
+        api_key: None,
+        chat_kwargs: serde_json::Map::new(),
+        request_log_path: None,
     }];
 
     let app = llmconduit::build_app(config);

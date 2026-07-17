@@ -7,6 +7,7 @@ use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -784,12 +785,10 @@ fn retain_finite_prices(table: &mut HashMap<String, ModelPrice>) {
 #[derive(Debug, Clone)]
 pub struct UpstreamConfig {
     pub name: String,
-    pub upstream_base_url: Url,
-    pub upstream_api_key: Option<String>,
-    pub upstream_model: Option<String>,
-    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    pub upstream_request_log_path: Option<PathBuf>,
-    pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
+    pub url: Url,
+    pub api_key: Option<String>,
+    pub chat_kwargs: JsonMap<String, JsonValue>,
+    pub request_log_path: Option<PathBuf>,
 }
 
 /// A resolved ad-hoc model route (G7): request-model name → synthetic upstream.
@@ -1144,21 +1143,34 @@ pub struct PersistedFallbackUpstream {
     pub upstream_request_log_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedUpstream {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub upstream_base_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_model: Option<String>,
-    #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
-    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_request_log_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
+    pub name: String,
+    #[serde(alias = "upstream_base_url")]
+    pub url: String,
+    #[serde(
+        default,
+        alias = "upstream_api_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_key: Option<String>,
+    #[serde(
+        default,
+        alias = "upstream_chat_kwargs",
+        skip_serializing_if = "JsonMap::is_empty"
+    )]
+    pub chat_kwargs: JsonMap<String, JsonValue>,
+    #[serde(
+        default,
+        alias = "upstream_request_log_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_log_path: Option<String>,
+    // Removed-key detection only; presence is a startup error.
+    #[serde(default, skip_serializing)]
+    pub upstream_model: Option<JsonValue>,
+    #[serde(default, skip_serializing)]
+    pub fallback_upstreams: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1462,13 +1474,9 @@ impl Config {
                 push_dir(fallback.upstream_request_log_path.as_ref());
             }
         } else {
-            // Explicit-upstream routing mode: per-routing-upstream primaries and
-            // their nested fallbacks.
+            // Explicit-upstream routing mode: per-routing-upstream primaries.
             for upstream in &self.upstreams {
-                push_dir(upstream.upstream_request_log_path.as_ref());
-                for fallback in &upstream.fallback_upstreams {
-                    push_dir(fallback.upstream_request_log_path.as_ref());
-                }
+                push_dir(upstream.request_log_path.as_ref());
             }
             // In mixed mode (`upstreams` + `model_routes`), route providers
             // still write the top-level `upstream_request_log_path`, which the
@@ -1507,12 +1515,7 @@ impl Config {
             .enumerate()
             .map(|(index, provider)| parse_fallback_upstream(provider, index, "fallback_upstreams"))
             .collect::<Result<Vec<_>, String>>()?;
-        let upstreams = config
-            .upstreams
-            .iter()
-            .enumerate()
-            .map(parse_upstream)
-            .collect::<Result<Vec<_>, String>>()?;
+        let upstreams = parse_upstreams(&config.upstreams)?;
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
         let model_routes = resolve_model_routes(&config.model_routes)?;
@@ -2187,38 +2190,45 @@ fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<St
     }
 }
 
-fn parse_upstream(
-    (index, provider): (usize, &PersistedUpstream),
-) -> Result<UpstreamConfig, String> {
-    let upstream_base_url = Url::parse(provider.upstream_base_url.trim())
-        .map_err(|err| format!("invalid upstreams[{index}].upstream_base_url: {err}"))?;
-    let fallback_upstreams = provider
-        .fallback_upstreams
-        .iter()
-        .enumerate()
-        .map(|(fallback_index, fallback)| {
-            parse_fallback_upstream(
-                fallback,
-                fallback_index,
-                &format!("upstreams[{index}].fallback_upstreams"),
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(UpstreamConfig {
-        name: provider
-            .name
-            .as_ref()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| format!("upstream-{}", index + 1)),
-        upstream_base_url,
-        upstream_api_key: trim_nonempty(provider.upstream_api_key.as_deref()),
-        upstream_model: trim_nonempty(provider.upstream_model.as_deref()),
-        upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
-        upstream_request_log_path: trim_nonempty(provider.upstream_request_log_path.as_deref())
-            .map(PathBuf::from),
-        fallback_upstreams,
-    })
+/// Parses `upstreams:` entries into pure named endpoints. A request model's
+/// routing target is now named by a model profile (see README "Migrating"),
+/// so an entry no longer carries its own `upstream_model` remap or nested
+/// `fallback_upstreams` chain -- those keys are detected here and rejected
+/// with the replacement they migrate to, rather than silently ignored.
+fn parse_upstreams(entries: &[PersistedUpstream]) -> Result<Vec<UpstreamConfig>, String> {
+    let mut seen_names = HashSet::new();
+    let mut upstreams = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let name = entry.name.trim();
+        if name.is_empty() {
+            return Err(format!("upstreams[{index}]: name must not be blank"));
+        }
+        if entry.upstream_model.is_some() {
+            return Err(format!(
+                "upstreams[{name}]: `upstream_model` was removed; set `upstream_model` on the model profile instead (see README \"Migrating\")"
+            ));
+        }
+        if entry.fallback_upstreams.is_some() {
+            return Err(format!(
+                "upstreams[{name}]: nested `fallback_upstreams` were removed; declare `fallbacks` on the model profile instead (see README \"Migrating\")"
+            ));
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            return Err(format!(
+                "upstreams[{index}]: duplicate upstream name {name:?}"
+            ));
+        }
+        let url = Url::parse(entry.url.trim())
+            .map_err(|err| format!("invalid upstreams[{index}].url: {err}"))?;
+        upstreams.push(UpstreamConfig {
+            name: name.to_string(),
+            url,
+            api_key: trim_nonempty(entry.api_key.as_deref()),
+            chat_kwargs: entry.chat_kwargs.clone(),
+            request_log_path: trim_nonempty(entry.request_log_path.as_deref()).map(PathBuf::from),
+        });
+    }
+    Ok(upstreams)
 }
 
 fn parse_fallback_upstream(
@@ -2957,30 +2967,19 @@ model_profiles:
     }
 
     #[test]
-    fn from_persisted_parses_explicit_upstreams_with_nested_fallbacks() {
+    fn from_persisted_parses_explicit_upstreams_as_named_endpoints() {
         let config = PersistedConfig {
             upstreams: vec![PersistedUpstream {
-                name: Some(" local ".to_string()),
-                upstream_base_url: " http://127.0.0.1:8000/v1 ".to_string(),
-                upstream_api_key: Some(" local-secret ".to_string()),
-                upstream_model: Some(" local-model ".to_string()),
-                upstream_chat_kwargs: JsonMap::from_iter([(
+                name: " local ".to_string(),
+                url: " http://127.0.0.1:8000/v1 ".to_string(),
+                api_key: Some(" local-secret ".to_string()),
+                chat_kwargs: JsonMap::from_iter([(
                     "chat_template_kwargs".to_string(),
                     json!({"thinking": true}),
                 )]),
-                upstream_request_log_path: Some(" /tmp/llmconduit-local.jsonl ".to_string()),
-                fallback_upstreams: vec![PersistedFallbackUpstream {
-                    name: Some(" backup ".to_string()),
-                    upstream_base_url: " https://openrouter.ai/api/v1 ".to_string(),
-                    upstream_api_key: Some(" backup-secret ".to_string()),
-                    upstream_model: Some(" backup-model ".to_string()),
-                    exposed_model: Some(" backup-alias ".to_string()),
-                    upstream_chat_kwargs: JsonMap::from_iter([(
-                        "provider".to_string(),
-                        json!({"order": ["openai"]}),
-                    )]),
-                    upstream_request_log_path: Some(" /tmp/llmconduit-backup.jsonl ".to_string()),
-                }],
+                request_log_path: Some(" /tmp/llmconduit-local.jsonl ".to_string()),
+                upstream_model: None,
+                fallback_upstreams: None,
             }],
             ..PersistedConfig::default()
         };
@@ -2990,29 +2989,43 @@ model_profiles:
         assert_eq!(result.upstreams.len(), 1);
         let upstream = &result.upstreams[0];
         assert_eq!(upstream.name, "local");
+        assert_eq!(upstream.url.as_str(), "http://127.0.0.1:8000/v1");
+        assert_eq!(upstream.api_key.as_deref(), Some("local-secret"));
         assert_eq!(
-            upstream.upstream_base_url.as_str(),
-            "http://127.0.0.1:8000/v1"
-        );
-        assert_eq!(upstream.upstream_api_key.as_deref(), Some("local-secret"));
-        assert_eq!(upstream.upstream_model.as_deref(), Some("local-model"));
-        assert_eq!(
-            upstream.upstream_chat_kwargs.get("chat_template_kwargs"),
+            upstream.chat_kwargs.get("chat_template_kwargs"),
             Some(&json!({"thinking": true}))
         );
         assert_eq!(
-            upstream.upstream_request_log_path.as_deref(),
+            upstream.request_log_path.as_deref(),
             Some(std::path::Path::new("/tmp/llmconduit-local.jsonl"))
         );
-        assert_eq!(upstream.fallback_upstreams.len(), 1);
-        assert_eq!(upstream.fallback_upstreams[0].name, "backup");
-        assert_eq!(
-            upstream.fallback_upstreams[0].upstream_model.as_deref(),
-            Some("backup-model")
-        );
-        assert_eq!(
-            upstream.fallback_upstreams[0].exposed_model.as_deref(),
-            Some("backup-alias")
+    }
+
+    /// A request model's routing target is now named by a model profile, so an
+    /// entry's own nested `fallback_upstreams` (the pre-profile-routing failover
+    /// chain) is a removed key, not silently ignored -- a startup error names
+    /// the profile-level replacement.
+    #[test]
+    fn from_persisted_rejects_nested_fallback_upstreams_on_entries() {
+        let config = PersistedConfig {
+            upstreams: vec![PersistedUpstream {
+                name: "local".to_string(),
+                url: "http://127.0.0.1:8000/v1".to_string(),
+                api_key: None,
+                chat_kwargs: JsonMap::new(),
+                request_log_path: None,
+                upstream_model: None,
+                fallback_upstreams: Some(
+                    json!([{"upstream_base_url": "https://openrouter.ai/api/v1"}]),
+                ),
+            }],
+            ..PersistedConfig::default()
+        };
+
+        let error = Config::from_persisted(&config).expect_err("nested fallback_upstreams");
+        assert!(
+            error.contains("fallback_upstreams") && error.contains("Migrating"),
+            "{error}"
         );
     }
 
@@ -4349,9 +4362,9 @@ model_profiles:
     #[test]
     fn debug_log_dirs_routing_mode_excludes_inactive_top_level_and_global_fallbacks() {
         // Non-empty `upstreams` => routing mode. The gateway uses only the
-        // per-routing-upstream clients and their nested fallbacks; the
-        // top-level `upstream_request_log_path` and global `fallback_upstreams`
-        // are never written to, so they must NOT be collected for cleanup.
+        // per-routing-upstream clients; the top-level `upstream_request_log_path`
+        // and global `fallback_upstreams` are never written to, so they must
+        // NOT be collected for cleanup.
         let config = Config::from_persisted(&PersistedConfig {
             upstream_request_log_path: Some(
                 "/tmp/llmconduit-inactive-top/primary.jsonl".to_string(),
@@ -4364,18 +4377,13 @@ model_profiles:
                 ..PersistedFallbackUpstream::default()
             }],
             upstreams: vec![PersistedUpstream {
-                upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
-                upstream_request_log_path: Some(
-                    "/tmp/llmconduit-routing/primary.jsonl".to_string(),
-                ),
-                fallback_upstreams: vec![PersistedFallbackUpstream {
-                    upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
-                    upstream_request_log_path: Some(
-                        "/tmp/llmconduit-routing-fallback/backup.jsonl".to_string(),
-                    ),
-                    ..PersistedFallbackUpstream::default()
-                }],
-                ..PersistedUpstream::default()
+                name: "routing".to_string(),
+                url: "http://127.0.0.1:8000/v1".to_string(),
+                api_key: None,
+                chat_kwargs: JsonMap::new(),
+                request_log_path: Some("/tmp/llmconduit-routing/primary.jsonl".to_string()),
+                upstream_model: None,
+                fallback_upstreams: None,
             }],
             ..PersistedConfig::default()
         })
@@ -4384,11 +4392,8 @@ model_profiles:
         let dirs = config.debug_log_dirs();
         assert_eq!(
             dirs,
-            vec![
-                PathBuf::from("/tmp/llmconduit-routing"),
-                PathBuf::from("/tmp/llmconduit-routing-fallback"),
-            ],
-            "routing mode must collect only routing-upstream + nested-fallback log dirs"
+            vec![PathBuf::from("/tmp/llmconduit-routing")],
+            "routing mode must collect only routing-upstream log dirs"
         );
         assert!(
             !dirs.contains(&PathBuf::from("/tmp/llmconduit-inactive-top")),
@@ -4433,8 +4438,13 @@ model_profiles:
         let config = Config::from_persisted(&PersistedConfig {
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             upstreams: vec![PersistedUpstream {
-                upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
-                ..PersistedUpstream::default()
+                name: "routing".to_string(),
+                url: "http://127.0.0.1:8000/v1".to_string(),
+                api_key: None,
+                chat_kwargs: JsonMap::new(),
+                request_log_path: None,
+                upstream_model: None,
+                fallback_upstreams: None,
             }],
             ..PersistedConfig::default()
         })

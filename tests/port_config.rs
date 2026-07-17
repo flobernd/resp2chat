@@ -557,3 +557,45 @@ fn writing_config_to_toml_path_errors_and_creates_no_file() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// `upstreams:` entries are pure named endpoints
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upstream_entries_parse_short_and_aliased_names() {
+    let yaml = r#"
+upstreams:
+  - name: local
+    url: "http://127.0.0.1:8000/v1"
+  - name: aliased
+    upstream_base_url: "http://127.0.0.1:8001/v1"
+    upstream_api_key: "k"
+"#;
+    let persisted: PersistedConfig = serde_yaml::from_str(yaml).expect("yaml");
+    let config = Config::from_persisted(&persisted).expect("config");
+    assert_eq!(config.upstreams[0].name, "local");
+    assert_eq!(config.upstreams[1].url.as_str(), "http://127.0.0.1:8001/v1");
+    assert_eq!(config.upstreams[1].api_key.as_deref(), Some("k"));
+}
+
+#[test]
+fn upstream_entry_rejects_removed_keys_and_duplicates() {
+    for (yaml_fragment, needle) in [
+        ("upstream_model: \"m\"", "upstream_model"),
+        ("fallback_upstreams: []", "fallback_upstreams"),
+    ] {
+        let yaml =
+            format!("upstreams:\n  - name: local\n    url: \"http://h/v1\"\n    {yaml_fragment}\n");
+        let persisted: PersistedConfig = serde_yaml::from_str(&yaml).expect("yaml");
+        let err = Config::from_persisted(&persisted).expect_err("must reject");
+        assert!(err.contains(needle) && err.contains("Migrating"), "{err}");
+    }
+    let dup = "upstreams:\n  - name: local\n    url: \"http://h/v1\"\n  - name: LOCAL\n    url: \"http://h2/v1\"\n";
+    let persisted: PersistedConfig = serde_yaml::from_str(dup).expect("yaml");
+    assert!(
+        Config::from_persisted(&persisted)
+            .expect_err("dup")
+            .contains("duplicate upstream name")
+    );
+}

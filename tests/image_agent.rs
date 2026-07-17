@@ -30,9 +30,7 @@ use common::user_message_with_image;
 use axum::body::Body;
 use axum::http::Request;
 use futures::StreamExt;
-use llmconduit::config::FallbackUpstreamConfig;
 use llmconduit::config::UnsupportedImagePolicy;
-use llmconduit::config::UpstreamConfig;
 use llmconduit::models::chat::ChatChunkChoice;
 use llmconduit::models::chat::ChatCompletionChunk;
 use llmconduit::models::chat::ChatDelta;
@@ -53,7 +51,6 @@ use tower::ServiceExt;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
-use wiremock::matchers::body_partial_json;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -1084,98 +1081,6 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_anthropic() {
         "no tool_use block for analyzeImage"
     );
     assert!(text.contains("A leaf."));
-}
-
-#[tokio::test]
-async fn image_agent_resolved_alias_to_kimi_passes_images_through() {
-    // Review #2: an exposed-fallback alias that resolves to a native-vision
-    // backend (Kimi) must NOT strip images — gating uses the FINAL routed model.
-    // Build a routing gateway whose exposed alias "vision-alias" maps to the
-    // fallback's upstream_model "Kimi-K2.6".
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "object": "list",
-            "data": [{ "id": "primary-text-model", "object": "model" }]
-        })))
-        .mount(&server)
-        .await;
-    // The chat endpoint must receive the RAW image (proof it was not stripped).
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({ "model": "Kimi-K2.6" })))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(chat_completion_sse_body(&[
-                    json!({
-                        "id": "chat-1",
-                        "choices": [{ "index": 0, "delta": { "content": "I see a square." }, "finish_reason": "stop" }]
-                    }),
-                ])),
-        )
-        .mount(&server)
-        .await;
-
-    let base = format!("{}/v1", server.uri());
-    let mut config = image_agent_config();
-    config.upstreams = vec![UpstreamConfig {
-        name: "primary".to_string(),
-        upstream_base_url: base.parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstream_request_log_path: None,
-        fallback_upstreams: vec![FallbackUpstreamConfig {
-            name: "kimi-fallback".to_string(),
-            upstream_base_url: base.parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: Some("Kimi-K2.6".to_string()),
-            exposed_model: Some("vision-alias".to_string()),
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-        }],
-    }];
-    let app = llmconduit::build_app(config);
-
-    let body = json!({
-        "model": "vision-alias",
-        "stream": true,
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [
-                { "type": "input_text", "text": "what is this?" },
-                { "type": "input_image", "image_url": TEST_IMAGE_DATA_URL }
-            ]
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(
-        response.status().as_u16(),
-        200,
-        "the body_partial_json model=Kimi-K2.6 matcher proves the raw image reached Kimi unstripped"
-    );
-    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-        .await
-        .expect("body");
-    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(
-        !text.contains("analyzeImage"),
-        "native-vision alias must not inject analyzeImage"
-    );
-    assert!(text.contains("I see a square."));
 }
 
 #[tokio::test]

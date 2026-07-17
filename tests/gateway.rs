@@ -7388,10 +7388,9 @@ fn conformance_harness_is_reachable_from_gateway_integration_crate() {
 }
 
 #[tokio::test]
-async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fallbacks() {
+async fn explicit_upstreams_models_endpoint_returns_primary_union() {
     let first = MockServer::start().await;
     let second = MockServer::start().await;
-    let fallback = MockServer::start().await;
 
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -7415,41 +7414,22 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
         })))
         .mount(&second)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "fallback-only"}]
-        })))
-        .mount(&fallback)
-        .await;
 
     let mut config = test_config();
     config.upstreams = vec![
         UpstreamConfig {
             name: "first".to_string(),
-            upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-            fallback_upstreams: vec![FallbackUpstreamConfig {
-                name: "fallback".to_string(),
-                upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
-                upstream_api_key: None,
-                upstream_model: Some("fallback-only".to_string()),
-                exposed_model: None,
-                upstream_chat_kwargs: JsonMap::new(),
-                upstream_request_log_path: None,
-            }],
+            url: format!("{}/v1/", first.uri()).parse().expect("url"),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
         },
         UpstreamConfig {
             name: "second".to_string(),
-            upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-            fallback_upstreams: Vec::new(),
+            url: format!("{}/v1/", second.uri()).parse().expect("url"),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
         },
     ];
 
@@ -7521,21 +7501,17 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
     config.upstreams = vec![
         UpstreamConfig {
             name: "first".to_string(),
-            upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-            fallback_upstreams: Vec::new(),
+            url: format!("{}/v1/", first.uri()).parse().expect("url"),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
         },
         UpstreamConfig {
             name: "second".to_string(),
-            upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-            fallback_upstreams: Vec::new(),
+            url: format!("{}/v1/", second.uri()).parse().expect("url"),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
         },
     ];
 
@@ -7624,21 +7600,17 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
     config.upstreams = vec![
         UpstreamConfig {
             name: "first".to_string(),
-            upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-            fallback_upstreams: Vec::new(),
+            url: format!("{}/v1/", first.uri()).parse().expect("url"),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
         },
         UpstreamConfig {
             name: "second".to_string(),
-            upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-            fallback_upstreams: Vec::new(),
+            url: format!("{}/v1/", second.uri()).parse().expect("url"),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
         },
     ];
     let app = llmconduit::build_app(config);
@@ -7694,268 +7666,6 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
         .count();
     assert_eq!(first_chat_requests, 2);
     assert_eq!(second_chat_requests, 0);
-}
-
-#[tokio::test]
-async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstream() {
-    let first = MockServer::start().await;
-    let fallback = MockServer::start().await;
-    let second = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "first-model"}]
-        })))
-        .mount(&first)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "second-model"}]
-        })))
-        .mount(&second)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({"model": "first-model"})))
-        .respond_with(ResponseTemplate::new(503).set_body_string("first unavailable"))
-        .mount(&first)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({"model": "fallback-model"})))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(chat_completion_sse_body(&[json!({
-                    "id": "chat-fallback",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": "fallback"},
-                        "finish_reason": null
-                    }],
-                    "usage": null
-                })])),
-        )
-        .mount(&fallback)
-        .await;
-
-    let mut config = test_config();
-    config.upstream_failure_cooldown_secs = 3600;
-    config.upstreams = vec![
-        UpstreamConfig {
-            name: "first".to_string(),
-            upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-            fallback_upstreams: vec![FallbackUpstreamConfig {
-                name: "fallback".to_string(),
-                upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
-                upstream_api_key: None,
-                upstream_model: Some("fallback-model".to_string()),
-                exposed_model: None,
-                upstream_chat_kwargs: JsonMap::new(),
-                upstream_request_log_path: None,
-            }],
-        },
-        UpstreamConfig {
-            name: "second".to_string(),
-            upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-            fallback_upstreams: Vec::new(),
-        },
-    ];
-
-    let app = llmconduit::build_app(config);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "first-model",
-                        "stream": false,
-                        "messages": [{"role": "user", "content": "hi"}]
-                    })
-                    .to_string(),
-                ))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    assert_eq!(
-        body["choices"][0]["message"]["content"].as_str(),
-        Some("fallback")
-    );
-
-    let fallback_chat_requests = fallback
-        .received_requests()
-        .await
-        .expect("fallback requests")
-        .into_iter()
-        .filter(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-        })
-        .count();
-    let second_chat_requests = second
-        .received_requests()
-        .await
-        .expect("second requests")
-        .into_iter()
-        .filter(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-        })
-        .count();
-    assert_eq!(fallback_chat_requests, 1);
-    assert_eq!(second_chat_requests, 0);
-}
-
-#[tokio::test]
-async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback() {
-    let first = MockServer::start().await;
-    let fallback = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": [{"id": "local-default"}]
-        })))
-        .mount(&first)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({"model": "GLM-5.1"})))
-        .respond_with(ResponseTemplate::new(503).set_body_string("local unavailable"))
-        .mount(&first)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({"model": "z-ai/glm-5.1"})))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(chat_completion_sse_body(&[json!({
-                    "id": "chat-fallback",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": "fallback alias"},
-                        "finish_reason": null
-                    }],
-                    "usage": null
-                })])),
-        )
-        .mount(&fallback)
-        .await;
-
-    let mut config = test_config();
-    config.upstream_failure_cooldown_secs = 3600;
-    config.upstreams = vec![UpstreamConfig {
-        name: "first".to_string(),
-        upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
-        upstream_api_key: None,
-        upstream_model: None,
-        upstream_chat_kwargs: JsonMap::new(),
-        upstream_request_log_path: None,
-        fallback_upstreams: vec![FallbackUpstreamConfig {
-            name: "fallback".to_string(),
-            upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: Some("z-ai/glm-5.1".to_string()),
-            exposed_model: Some("GLM-5.1".to_string()),
-            upstream_chat_kwargs: JsonMap::new(),
-            upstream_request_log_path: None,
-        }],
-    }];
-
-    let app = llmconduit::build_app(config);
-    let models_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("models response");
-    assert_eq!(models_response.status().as_u16(), 200);
-    let models_body_bytes = axum::body::to_bytes(models_response.into_body(), 4096)
-        .await
-        .expect("read models body");
-    let models_body: serde_json::Value =
-        serde_json::from_slice(&models_body_bytes).expect("valid models json");
-    let ids = models_body["data"]
-        .as_array()
-        .expect("data array")
-        .iter()
-        .map(|entry| entry["id"].as_str().expect("model id"))
-        .collect::<Vec<_>>();
-    assert_eq!(ids, vec!["local-default", "GLM-5.1"]);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "GLM-5.1",
-                        "stream": false,
-                        "messages": [{"role": "user", "content": "hi"}]
-                    })
-                    .to_string(),
-                ))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .expect("read body");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    assert_eq!(body["model"], "GLM-5.1");
-    assert_eq!(
-        body["choices"][0]["message"]["content"].as_str(),
-        Some("fallback alias")
-    );
-
-    let first_chat_requests = first
-        .received_requests()
-        .await
-        .expect("first requests")
-        .into_iter()
-        .filter(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-        })
-        .count();
-    let fallback_chat_requests = fallback
-        .received_requests()
-        .await
-        .expect("fallback requests")
-        .into_iter()
-        .filter(|request| {
-            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-        })
-        .count();
-    assert_eq!(first_chat_requests, 0);
-    assert_eq!(fallback_chat_requests, 1);
 }
 
 // ---------------------------------------------------------------------------

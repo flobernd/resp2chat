@@ -166,33 +166,16 @@ pub fn build_app_with_gateway_and_options(
             .iter()
             .map(|provider| {
                 let primary_client = make_upstream_client(
-                    provider.upstream_base_url.clone(),
-                    provider.upstream_api_key.clone(),
-                    provider.upstream_request_log_path.clone(),
+                    provider.url.clone(),
+                    provider.api_key.clone(),
+                    provider.request_log_path.clone(),
                 );
-                let fallback_providers = provider
-                    .fallback_upstreams
-                    .iter()
-                    .map(|fallback| {
-                        FailoverUpstreamProvider::new(
-                            fallback.name.clone(),
-                            make_upstream_client(
-                                fallback.upstream_base_url.clone(),
-                                fallback.upstream_api_key.clone(),
-                                fallback.upstream_request_log_path.clone(),
-                            ),
-                            fallback.upstream_model.clone(),
-                            fallback.exposed_model.clone(),
-                            fallback.upstream_chat_kwargs.clone(),
-                        )
-                    })
-                    .collect();
                 RoutingUpstreamProvider::new(
                     provider.name.clone(),
                     primary_client,
-                    provider.upstream_model.clone(),
-                    provider.upstream_chat_kwargs.clone(),
-                    fallback_providers,
+                    None,
+                    provider.chat_kwargs.clone(),
+                    Vec::new(),
                     Duration::from_secs(config.upstream_failure_cooldown_secs),
                 )
             })
