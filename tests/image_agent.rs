@@ -51,6 +51,7 @@ use llmconduit::replay::ReplayRecord;
 use llmconduit::replay::ReplayStore;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::time::Duration;
 use tower::ServiceExt;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -85,6 +86,38 @@ fn offers_analyze_image(request: &llmconduit::models::chat::ChatCompletionReques
         .tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"))
+}
+
+/// Count of recorded POSTs to a wiremock server's `/chat/completions` route,
+/// filtering out any `/v1/models` probe the routing client may also issue.
+async fn chat_completions_post_count(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("server records requests")
+        .into_iter()
+        .filter(|req| req.url.path().ends_with("/chat/completions"))
+        .count()
+}
+
+/// Poll `server` until at least `at_least` `/chat/completions` POSTs have
+/// landed, bounded by `bound`. The two-server wiremock pattern has no
+/// `Notify`-style hook into "the executor is now parked in the analyzer
+/// dispatch" (unlike the custom mock clients in `tests/gateway.rs`), so this
+/// stands in for that signal.
+async fn wait_for_chat_completions_posts(server: &MockServer, at_least: usize, bound: Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        let count = chat_completions_post_count(server).await;
+        if count >= at_least {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {at_least} chat/completions POST(s), saw {count}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 // ===========================================================================
@@ -285,6 +318,262 @@ async fn analysis_call_lands_on_analyzer_profile_upstream_with_served_model() {
     assert!(
         body_text.contains("iVBORw0KGgo"),
         "the analyzer upstream receives the raw image: {body_text}"
+    );
+}
+
+#[tokio::test]
+async fn analyzer_timeout_surfaces_as_tool_result_error_without_hanging_the_turn() {
+    // The analyzer mock delays its response well past a small configured
+    // `request_timeout`, so the executor's `timeout()` branch must win the
+    // select before the delay ever elapses - same two-server wiremock setup as
+    // `analysis_call_lands_on_analyzer_profile_upstream_with_served_model`.
+    const REQUEST_TIMEOUT_SECS: u64 = 1;
+    const ANALYZER_DELAY_SECS: u64 = 5;
+    const WALL_TIME_BOUND: Duration = Duration::from_secs(3);
+
+    let text_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "tool_calls": [{
+                            "id": "call_img_1",
+                            "index": 0,
+                            "type": "function",
+                            "function": {
+                                "name": "analyzeImage",
+                                "arguments": "{\"imageId\":[\"1\"],\"task\":\"describe\"}"
+                            }
+                        }]},
+                        "finish_reason": "tool_calls"
+                    }]
+                })])),
+        )
+        .up_to_n_times(1)
+        .mount(&text_server)
+        .await;
+    // Round 2 on the text upstream: the post-timeout completion round.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-2",
+                    "choices": [{"index": 0, "delta": {"content": "Sorry, no image."}, "finish_reason": "stop"}]
+                })])),
+        )
+        .mount(&text_server)
+        .await;
+
+    let vision_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_delay(Duration::from_secs(ANALYZER_DELAY_SECS))
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "vis-1",
+                    "choices": [{"index": 0, "delta": {"content": "A red square."}, "finish_reason": "stop"}]
+                })])),
+        )
+        .mount(&vision_server)
+        .await;
+
+    let config = common::config_from_yaml(&format!(
+        "request_timeout_secs: {timeout}\n\
+           upstreams:\n  \
+             - name: text_up\n    url: \"{text}/v1/\"\n  \
+             - name: vision_up\n    url: \"{vision}/v1/\"\n\
+           model_profiles:\n  \
+             \"glm-5.1\":\n    upstream: text_up\n    image_analysis:\n      model: \"vision-analyzer\"\n  \
+             \"vision-analyzer\":\n    upstream: vision_up\n    upstream_model: \"served-vision-model\"\n",
+        timeout = REQUEST_TIMEOUT_SECS,
+        text = text_server.uri(),
+        vision = vision_server.uri(),
+    ));
+    let (_app, gateway) = llmconduit::build_app_with_gateway(config);
+
+    let request = base_request(vec![user_message_with_image(
+        "what is this?",
+        TEST_IMAGE_DATA_URL,
+    )]);
+    let started = std::time::Instant::now();
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < WALL_TIME_BOUND,
+        "the turn must not hang past the configured timeout: took {elapsed:?}"
+    );
+
+    let names = event_names(&events);
+    assert!(names.contains(&"response.completed"));
+    assert!(!names.contains(&"response.failed"), "turn must not fail");
+
+    let text_posts: Vec<_> = text_server
+        .received_requests()
+        .await
+        .expect("text server recorded requests")
+        .into_iter()
+        .filter(|req| req.url.path().ends_with("/chat/completions"))
+        .collect();
+    assert_eq!(
+        text_posts.len(),
+        2,
+        "tool-call round + post-timeout completion round"
+    );
+    let round2: serde_json::Value =
+        serde_json::from_slice(&text_posts[1].body).expect("round 2 body is JSON");
+    let tool_msg = round2["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default();
+    assert!(
+        tool_msg.contains("Vision analysis timed out"),
+        "analyzer timeout becomes model-visible tool text: {tool_msg}"
+    );
+}
+
+#[tokio::test]
+async fn analyzer_dispatch_cancels_on_client_hangup_before_completion_round() {
+    // Verifies the end-to-end contract: after the client hangs up mid-analysis
+    // (mirroring the `ChunkThenPendingUpstream`/
+    // `cancels_mid_stream_when_client_disconnects` pattern in
+    // `tests/gateway.rs`), no further upstream dispatch ever happens. It
+    // cannot on its own prove the vision-specific `tx.closed()` arm in
+    // `run_image_analysis` is responsible, since `run_turn`'s round loop
+    // carries its own redundant hangup checks ahead of every dispatch (the
+    // `D6` comments describe composing the kill token with "every
+    // `tx.closed()` client-hangup check") - any of them could produce this
+    // same observable. Isolating the exact guard would need an assertion that
+    // discriminates by promptness, which would be flake-prone against real
+    // HTTP and scheduling jitter, so this test settles for the behavior-level
+    // contract.
+    //
+    // The post-hangup observation window (SETTLE_TIME) MUST exceed the
+    // analyzer's delay: if it didn't, "no completion round yet" would be true
+    // regardless of whether cancellation actually happened, making the
+    // assertion vacuous. With the window exceeding the delay, an uncancelled
+    // dispatch would complete and land round 2 well before the window closes,
+    // so its absence is real evidence some guard tore the parked call down.
+    const ANALYZER_DELAY_SECS: u64 = 2;
+    const POLL_BOUND: Duration = Duration::from_secs(5);
+    const SETTLE_TIME: Duration = Duration::from_secs(4);
+    // Not a cancellation-timing proof (SETTLE_TIME deliberately exceeds the
+    // delay above) - just a hang safety net.
+    const WALL_TIME_BOUND: Duration = Duration::from_secs(8);
+
+    let text_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "tool_calls": [{
+                            "id": "call_img_1",
+                            "index": 0,
+                            "type": "function",
+                            "function": {
+                                "name": "analyzeImage",
+                                "arguments": "{\"imageId\":[\"1\"],\"task\":\"describe\"}"
+                            }
+                        }]},
+                        "finish_reason": "tool_calls"
+                    }]
+                })])),
+        )
+        .up_to_n_times(1)
+        .mount(&text_server)
+        .await;
+    // Mounted defensively: if the cancellation guard is broken this must never
+    // be reached, but an unmounted route would mask a regression behind an
+    // unrelated 404 instead of the intended request-count assertion below.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-2",
+                    "choices": [{"index": 0, "delta": {"content": "It is a red square."}, "finish_reason": "stop"}]
+                })])),
+        )
+        .mount(&text_server)
+        .await;
+
+    let vision_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_delay(Duration::from_secs(ANALYZER_DELAY_SECS))
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "vis-1",
+                    "choices": [{"index": 0, "delta": {"content": "A red square."}, "finish_reason": "stop"}]
+                })])),
+        )
+        .mount(&vision_server)
+        .await;
+
+    let config = common::config_from_yaml(&format!(
+        "upstreams:\n  \
+           - name: text_up\n    url: \"{text}/v1/\"\n  \
+           - name: vision_up\n    url: \"{vision}/v1/\"\n\
+         model_profiles:\n  \
+           \"glm-5.1\":\n    upstream: text_up\n    image_analysis:\n      model: \"vision-analyzer\"\n  \
+           \"vision-analyzer\":\n    upstream: vision_up\n    upstream_model: \"served-vision-model\"\n",
+        text = text_server.uri(),
+        vision = vision_server.uri(),
+    ));
+    let (_app, gateway) = llmconduit::build_app_with_gateway(config);
+
+    let request = base_request(vec![user_message_with_image(
+        "what is this?",
+        TEST_IMAGE_DATA_URL,
+    )]);
+    let started = std::time::Instant::now();
+    let stream = gateway.stream_responses(request).await.expect("stream");
+
+    // Wait for the analyzer dispatch to actually reach the vision upstream (the
+    // executor is now parked in the cancellable select) before hanging up.
+    wait_for_chat_completions_posts(&vision_server, 1, POLL_BOUND).await;
+    assert_eq!(
+        chat_completions_post_count(&text_server).await,
+        1,
+        "only the tool-call round landed before the hang-up"
+    );
+
+    // The client hangs up mid-analysis: dropping the stream drops the mpsc
+    // receiver, resolving `tx.closed()` in the executor's select.
+    drop(stream);
+
+    // Outlast the analyzer's delay: an uncancelled dispatch would have
+    // received its response and dispatched round 2 well before this window
+    // closes, so a still-absent round 2 here is evidence of real cancellation.
+    tokio::time::sleep(SETTLE_TIME).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < WALL_TIME_BOUND,
+        "test should not hang well past the observation window: took {elapsed:?}"
+    );
+    assert_eq!(
+        chat_completions_post_count(&text_server).await,
+        1,
+        "the completion round must never be dispatched after a mid-analysis hang-up"
     );
 }
 
