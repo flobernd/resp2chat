@@ -324,7 +324,6 @@ mod integration {
     use axum::http::Request;
     use llmconduit::config::Config;
     use llmconduit::config::PersistedConfig;
-    use llmconduit::config::UnsupportedImagePolicy;
     use uuid::Uuid;
 
     /// Parse an `upstreams:` / `model_profiles:` YAML through the production
@@ -367,12 +366,8 @@ mod integration {
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         }
     }

@@ -386,18 +386,13 @@ pub struct BackendCandidate {
 
 /// Typed backend-candidate plan: the routing/failover layer's answer to "which
 /// backend models could serve this request pre-first-chunk, and what context
-/// window does each report?" G4 native-vision gating consumes the candidate
-/// MODELS instead of re-deriving the set in the engine (T2); G3 pre-flight
-/// budgeting consumes the candidate CONTEXT LIMITS (conservative MIN — the
-/// strictest window across the failover chain — so a failover to a smaller
-/// model cannot overflow; unknown ⇒ no-op) instead of budgeting against the
-/// pre-routing `resolved_model` (T9). The `genuine` signal — whether the
-/// request model truly resolved vs. fell back to a catalog default — is
-/// ENGINE-side (a byproduct of `normalize_upstream_model`, not a re-derived
-/// ladder; see `backend_is_native_vision`).
+/// window does each report?" G3 pre-flight budgeting consumes the candidate
+/// CONTEXT LIMITS (conservative MIN — the strictest window across the failover
+/// chain — so a failover to a smaller model cannot overflow; unknown ⇒ no-op)
+/// instead of budgeting against the pre-routing `resolved_model` (T9).
 ///
-/// Empty `candidates` ⇒ unknown candidate set (catalog-load failure): the gate
-/// treats it as strip+offload, budgeting no-ops.
+/// Empty `candidates` ⇒ unknown candidate set (catalog-load failure): budgeting
+/// no-ops.
 #[derive(Debug, Clone)]
 pub struct BackendCandidatePlan {
     pub candidates: Vec<BackendCandidate>,
@@ -445,14 +440,11 @@ pub trait UpstreamClient: Send + Sync {
         collect_supported_model_catalog(response).await
     }
 
-    /// Every backend model `requested_model` could ACTUALLY be served by
-    /// pre-first-chunk, after the profile chain's per-step model rewrite (G4
-    /// review #2 + round-2 #1). This enumerates the full candidate set — the
-    /// primary AND every declared fallback — because failover happens before the
-    /// first chunk, so the model that ultimately serves may be any of them.
-    /// Native-vision gating
-    /// uses the SAFE invariant over this set (passthrough only if EVERY candidate
-    /// is native-vision), so it can never disagree with the provider that serves.
+    /// Every backend model `requested_model` could ACTUALLY be served
+    /// pre-first-chunk, after the profile chain's per-step model rewrite. This
+    /// enumerates the full candidate set — the primary AND every declared
+    /// fallback — because failover happens before the first chunk, so the model
+    /// that ultimately serves may be any of them.
     ///
     /// Default impl: thin projection over
     /// [`backend_candidate_plan`](Self::backend_candidate_plan) — the single
@@ -468,9 +460,8 @@ pub trait UpstreamClient: Send + Sync {
     }
 
     /// Typed backend-candidate plan for `requested_model` — the routing/failover
-    /// layer's candidate set (model + per-candidate context limit) for G4
-    /// native-vision gating (T2) and G3 pre-flight budgeting (T9). The `genuine`
-    /// signal is engine-side; this method returns only `candidates`.
+    /// layer's candidate set (model + per-candidate context limit) for G3
+    /// pre-flight budgeting (T9).
     ///
     /// Default impl: a single-provider passthrough sends the request model
     /// unchanged, so the only candidate is `requested_model` itself with no
@@ -2021,12 +2012,11 @@ impl UpstreamClient for FailoverUpstreamClient {
     /// Typed plan: a failover chain's candidate set is each provider's
     /// effective model — its `upstream_model` rewrite (matching
     /// `request_for_provider`) or the request model when it sends through
-    /// unchanged (G4 round-2 #1). We enumerate ALL providers (not just
-    /// currently-available ones): cooldown is transient, so a fallback that is
-    /// non-native must still force strip+offload. Context limits are `None`
-    /// (a failover chain does not load per-provider `/v1/models` catalogs, so
-    /// G3 budgeting no-ops — matching pre-T9 behavior). `candidate_backend_models`
-    /// (trait default) projects from this.
+    /// unchanged. We enumerate ALL providers (not just currently-available
+    /// ones) because cooldown is transient, so any of them may serve
+    /// pre-first-chunk. Context limits are `None` (a failover chain does not
+    /// load per-provider `/v1/models` catalogs, so G3 budgeting no-ops —
+    /// matching pre-T9 behavior).
     async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         let candidates = self
             .providers

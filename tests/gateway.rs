@@ -5,7 +5,6 @@ use futures::StreamExt;
 use futures::stream;
 use llmconduit::config::Config;
 use llmconduit::config::PersistedConfig;
-use llmconduit::config::UnsupportedImagePolicy;
 use llmconduit::engine::Gateway;
 use llmconduit::models::chat::ChatChunkChoice;
 use llmconduit::models::chat::ChatCompletionChunk;
@@ -900,12 +899,8 @@ async fn forwards_configured_upstream_chat_kwargs() {
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         },
     );
@@ -972,12 +967,8 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
             max_request_body_bytes: 10 * 1024 * 1024,
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         },
     );
@@ -4005,16 +3996,12 @@ fn test_gateway_with_flow_store(upstream: MockUpstream, search: MockSearch) -> A
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(search),
-        vision,
         image_cache,
         MonitorHub::new(128),
         None,
@@ -4037,9 +4024,6 @@ fn test_gateway_with_metrics(
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     let flow_store = llmconduit::dashboard_flow::DashboardFlowStore::new();
     let metrics = llmconduit::metrics::MetricsLayer::new();
@@ -4049,7 +4033,6 @@ fn test_gateway_with_metrics(
             ReplayStore::new(1000),
             Arc::new(upstream),
             Arc::new(MockSearch::default()),
-            vision,
             image_cache,
             MonitorHub::new(128),
             None,
@@ -4065,16 +4048,12 @@ fn test_gateway_with_metrics(
 /// a live MonitorHub.
 fn test_gateway_with_flow_store_upstream(upstream: Arc<dyn UpstreamClient>) -> Arc<Gateway> {
     let config = test_config();
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         upstream,
         Arc::new(MockSearch::default()),
-        vision,
         image_cache,
         MonitorHub::new(128),
         None,
@@ -5063,9 +5042,6 @@ fn d13_gateway(
 ) -> Arc<Gateway> {
     let mut config = test_config();
     config.price_table = d13_price_table();
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(
         Gateway::new(
@@ -5073,7 +5049,6 @@ fn d13_gateway(
             ReplayStore::new(1000),
             upstream,
             Arc::new(MockSearch::default()),
-            vision,
             image_cache,
             MonitorHub::new(128),
             None,
@@ -6471,20 +6446,14 @@ fn test_gateway_with_config_and_raw_output(
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
-    // Non-image-agent tests get a no-op vision client; the cache is built from
-    // config and never activated unless `image_agent_enabled` + `vision_url`.
-    // A real (never-called) `ReqwestVisionClient` keeps this builder independent
-    // of the `MockVisionClient`, which now lives with the image-agent suite.
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
+    // Non-image-agent tests never activate the agent (no profile `image_analysis`),
+    // so the cache is built from config and images pass through untouched.
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(search),
-        vision,
         image_cache,
         MonitorHub::new(128),
         raw_output,
@@ -6546,12 +6515,8 @@ fn test_config() -> Config {
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
         max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     }
 }
@@ -7557,14 +7522,12 @@ async fn chat_completions_preserves_multimodal_content_parts() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    // E2b: this test proves multimodal CONTENT-PART SHAPES survive canonical
-    // round-tripping unchanged (image_url/input_audio/file), which is only
-    // true when the backend is native-vision -- a non-native backend now
-    // degrades the image part to a text placeholder (the whole point of E2b;
-    // covered by its own dedicated tests). The model is Kimi-recognized by
-    // name (native-vision via the name-sniff fallback -- `native_vision` is no
-    // longer a profile knob) so this test keeps proving adapter fidelity, not
-    // image-degradation policy.
+    // This test proves multimodal CONTENT-PART SHAPES survive canonical
+    // round-tripping unchanged (image_url/input_audio/file). The profile
+    // declares no `image_analysis`, so images pass through to the upstream
+    // untouched (native passthrough is the default); the image agent's strip /
+    // residual-degrade seams have their own dedicated tests in
+    // `tests/image_agent.rs`.
     let config = test_config();
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
@@ -9473,28 +9436,18 @@ async fn cancels_mid_stream_when_client_disconnects() {
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
         max_request_body_bytes: 10 * 1024 * 1024,
-        image_agent_enabled: false,
-        vision_url: None,
-        vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     };
-    // The image agent is off here, so the vision client is inert; a real
-    // `ReqwestVisionClient` that is never called satisfies the constructor
-    // (the `MockVisionClient` now lives with the image-agent suite in
-    // `tests/common`).
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
+    // The image agent is off here (no profile `image_analysis`), so the cache is
+    // inert; it satisfies the constructor and is never activated.
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     let gateway = Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream.clone()),
         Arc::new(MockSearch::default()),
-        vision,
         image_cache,
         MonitorHub::new(128),
         None,
@@ -9556,9 +9509,6 @@ fn gateway_with_capture_dir(upstream: Arc<dyn UpstreamClient>, config: Config) -
         .clone()
         .map(llmconduit::turn_capture::TurnCapture::enabled)
         .unwrap_or_else(llmconduit::turn_capture::TurnCapture::disabled);
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(
         Gateway::new(
@@ -9566,7 +9516,6 @@ fn gateway_with_capture_dir(upstream: Arc<dyn UpstreamClient>, config: Config) -
             ReplayStore::new(1000),
             upstream,
             Arc::new(MockSearch::default()),
-            vision,
             image_cache,
             MonitorHub::new(128),
             None,
@@ -10236,19 +10185,20 @@ async fn f1e_ac14_oversized_frame_partial_and_no_hang() {
 /// NEITHER the secret VALUE nor any image `data:`/URL bytes. Runs through the REAL
 /// `ReqwestUpstreamClient` leaf (wiremock) so `upstream_request` is actually captured
 /// (the in-process `MockUpstream` bypasses the dispatch tap, leaving that section
-/// absent — see AC-7/8). Two redaction paths converge here: the middleware redacts the
-/// raw inbound body (secret keys + image URIs) BEFORE `inbound_request` capture, and
-/// the on-wire OpenAI request is redacted by `redacted_upstream_request_bytes` AND its
-/// text-only-model images are degraded to a placeholder (`UnsupportedImagePolicy::
-/// Placeholder`), so no image bytes reach `upstream_request` either. The
+/// absent — see AC-7/8). The profile declares no `image_analysis`, so the images pass
+/// through to the upstream; two redaction paths still converge on the CAPTURE: the
+/// middleware redacts the raw inbound body (secret keys + image URIs) BEFORE
+/// `inbound_request` capture, and the on-wire OpenAI request is redacted by
+/// `redacted_upstream_request_bytes` (secret keys + image URIs) BEFORE `upstream_request`
+/// capture, so no image bytes reach either captured section. The
 /// `served_response`/`upstream_response` sections are raw model OUTPUT (image redaction
 /// on the response stream is out of scope — F1e note), so this asserts the REQUEST
 /// sections. AGENTS.md line 137/144.
 ///
 /// NON-VACUOUS upstream side (F1f review r1): the inbound `api_key` is dropped by
-/// `/v1/messages` pre-lowering and the images are degraded, so no inbound secret
-/// naturally survives into `upstream_request` — an upstream-only assertion on those
-/// would pass even with the upstream redaction deleted. To genuinely exercise the
+/// `/v1/messages` pre-lowering and the on-wire image URIs are redacted at capture, so no
+/// inbound secret naturally survives into `upstream_request` — an upstream-only assertion
+/// on those would pass even with the upstream redaction deleted. To genuinely exercise the
 /// upstream secret pass, a sensitive-KEYED `upstream_chat_kwargs` value is seeded; it
 /// flattens into the on-wire `extra_body` and truly reaches `upstream_request`, where
 /// its value must be redacted (asserted below).
@@ -10281,9 +10231,10 @@ async fn f1f_ac16_request_sections_redact_secret_and_image_end_to_end() {
     route_all_to(&mut config, &server.uri());
     config.turn_capture_dir = Some(capture_dir.clone());
     // Non-vacuous `upstream_request` redaction (F1f review r1): the inbound top-level
-    // `api_key` below is DROPPED by `/v1/messages` before lowering (and the images are
-    // degraded), so nothing secret-bearing from the inbound body actually survives into
-    // `upstream_request` — deleting the upstream-side redaction would still pass. To
+    // `api_key` below is DROPPED by `/v1/messages` before lowering (and the on-wire image
+    // URIs are redacted at capture), so nothing secret-bearing from the inbound body
+    // actually survives into `upstream_request` — deleting the upstream-side redaction
+    // would still pass on the api_key alone. To
     // genuinely EXERCISE the `redacted_upstream_request_bytes` secret pass, seed a
     // sensitive-KEYED `upstream_chat_kwargs` value: it gap-fills into the on-wire
     // ChatCompletionRequest's (flattened) `extra_body` — proven to reach the wire by
@@ -11722,9 +11673,6 @@ fn test_gateway_with_turn_capture(upstream: MockUpstream, dir: std::path::PathBu
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(
         Gateway::new(
@@ -11732,7 +11680,6 @@ fn test_gateway_with_turn_capture(upstream: MockUpstream, dir: std::path::PathBu
             ReplayStore::new(1000),
             Arc::new(upstream),
             Arc::new(MockSearch::default()),
-            vision,
             image_cache,
             MonitorHub::new(128),
             None,

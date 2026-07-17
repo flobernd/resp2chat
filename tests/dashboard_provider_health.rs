@@ -78,9 +78,6 @@ fn empty_request() -> ChatCompletionRequest {
 /// default (the publication task only touches `upstream` + the publisher).
 fn gateway_with_upstream(upstream: Arc<dyn UpstreamClient>) -> Arc<Gateway> {
     let config = test_config();
-    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
-        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
-    );
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     let search = Arc::new(llmconduit::search::BraveSearchClient::new(
         reqwest::Client::new(),
@@ -91,7 +88,6 @@ fn gateway_with_upstream(upstream: Arc<dyn UpstreamClient>) -> Arc<Gateway> {
         ReplayStore::new(16),
         upstream,
         search,
-        vision,
         image_cache,
         llmconduit::monitor::MonitorHub::disabled(),
         None,

@@ -228,21 +228,17 @@ fn latest_user_message_content(input: &[ResponseItem]) -> Option<&[ContentItem]>
 // ===========================================================================
 // E2b — residual-image safety pass.
 //
-// The strip above (and the gating in `engine::activate_image_agent`) only ever
-// runs when the G4 agent is ACTIVE, and even then only ever touches
-// `role=="user"` + `image_url` content in the process of caching+offloading an
-// image for `analyzeImage`. That leaves real gaps that reach a non-native-
-// vision upstream verbatim: the agent disabled/no `vision_url` (the field
-// incident — an image fell straight through), `tool_choice=="none"`,
-// `file_id`-only images (Anthropic `source.type=="file"`,
-// `anthropic_to_responses.rs:712`), and images sitting in a non-`user` role.
-// This pass is the true choke point: it is role-agnostic, runs regardless of
-// whether the active agent engaged, and is the LAST thing standing between a
-// canonical request and a backend that will 400 on raw image bytes (the field
-// incident's "is not a multimodal model" error, which also tripped a cooldown
-// before E2a). See `engine.rs`'s call site (after `activate_image_agent`,
-// gated on `!backend_is_native_vision`) for the policy dispatch
-// (`Placeholder` vs `Reject`).
+// The strip above only ever touches `role=="user"` + `image_url` content in the
+// process of caching+offloading an image for `analyzeImage`. That leaves gaps
+// that would reach the text-only upstream verbatim: `file_id`-only images
+// (Anthropic `source.type=="file"`, `anthropic_to_responses.rs:712`) and images
+// sitting in a non-`user` role. This role-agnostic sweep catches them, and is
+// the LAST thing standing between a canonical request and a backend that will
+// 400 on raw image bytes (the field incident's "is not a multimodal model"
+// error, which also tripped a cooldown before E2a). See `engine.rs`'s call site
+// (after `activate_image_agent`, run only when the image agent is active) for
+// the policy dispatch (`Placeholder` vs `Reject`), keyed on the profile's
+// `image_analysis.residual_images`.
 // ===========================================================================
 
 /// E2b: whether `part` is a residual `ContentItem::InputImage` this pass must

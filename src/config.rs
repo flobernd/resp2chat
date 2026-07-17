@@ -533,23 +533,6 @@ fn valid_tag_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'))
 }
 
-/// E2b: policy for a residual `InputImage` (one the G4 image agent did not
-/// strip — agent inactive/disabled, `tool_choice=="none"`, a `file_id` image,
-/// a non-`user`-role image, or old history) that would otherwise reach a
-/// non-native-vision backend. `Placeholder` (the default) replaces it with an
-/// instructive text placeholder so the model self-corrects instead of the
-/// upstream 400ing on raw image bytes (the field incident this closes);
-/// `Reject` fails the turn before dispatch with a 4xx instead. No `Drop`
-/// variant — silently discarding image content with no signal to the model or
-/// client is a defect, not a policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum UnsupportedImagePolicy {
-    #[default]
-    Placeholder,
-    Reject,
-}
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -600,24 +583,10 @@ pub struct Config {
     /// 10 MiB (raise for very large prompts). Distinct from `max_sse_frame_bytes`,
     /// which bounds the UPSTREAM response read path, not the inbound request.
     pub max_request_body_bytes: usize,
-    /// Master switch for the G4 image agent (vision offload). When `false` the
-    /// strip/cache seam and `analyzeImage` tool injection are skipped entirely
-    /// and images flow to the upstream unchanged.
-    pub image_agent_enabled: bool,
-    /// OpenAI-compatible chat-completions endpoint of the vision backend the
-    /// image agent forwards stripped images to. `None` disables the agent even
-    /// when `image_agent_enabled` is true (no endpoint to call), matching
-    /// claude-relay's "skip without `vision_url`" gate.
-    pub vision_url: Option<Url>,
-    /// Model id sent to the vision backend.
-    pub vision_model: Option<String>,
     /// Per-session LRU image-cache capacity.
     pub image_cache_max_size: usize,
     /// Per-session image-cache TTL (seconds).
     pub image_cache_ttl_secs: u64,
-    /// E2b: policy applied to a residual image reaching a non-native-vision
-    /// backend after G4 gating. See [`UnsupportedImagePolicy`].
-    pub unsupported_image_policy: UnsupportedImagePolicy,
     /// Per-model price table (T13/D13), keyed by SERVED model id. Drives the
     /// dashboard's flow `cost` roll-up + the Sankey cost coloring + the
     /// `cost_per_min`/`cost_per_sec` rates. Loaded from the YAML `price_table:`
@@ -816,10 +785,14 @@ impl From<RawPersistedProfileFallback> for PersistedProfileFallback {
     }
 }
 
-/// Policy for an `image_analysis` redirect's residual image (one the redirect
-/// itself did not consume; see `UnsupportedImagePolicy`, which this mirrors).
-/// `Placeholder` (the default) replaces it with an instructive text
-/// placeholder; `Reject` fails the turn before dispatch with a 4xx instead.
+/// Policy for an `image_analysis` redirect's residual image: one left over
+/// after the redirect stripped the latest user turn (a `file_id` image, a
+/// non-`user`-role image, or old history). `Placeholder` (the default)
+/// replaces it with an instructive text placeholder so the model self-corrects
+/// instead of the text-only upstream 400ing on raw image bytes; `Reject` fails
+/// the turn before dispatch with a 4xx instead. No `Drop` variant: silently
+/// discarding image content with no signal to the model or client is a defect,
+/// not a policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ResidualImagePolicy {
@@ -1511,16 +1484,10 @@ impl Config {
             // Floor at 1 KiB so a misconfigured tiny/zero cap cannot reject every
             // request; the default (10 MiB) is far larger.
             max_request_body_bytes: config.max_request_body_bytes.max(1024),
-            // Vestigial vision fields kept compiling with inert defaults; Task 9
-            // rebuilds image handling around profile `image_analysis`.
-            image_agent_enabled: false,
-            vision_url: None,
-            vision_model: None,
             // Floor the capacity at 1 so a misconfigured zero does not make the
             // cache evict every image immediately and silently disable the agent.
             image_cache_max_size: config.image_cache_max_size.max(1),
             image_cache_ttl_secs: config.image_cache_ttl_secs,
-            unsupported_image_policy: UnsupportedImagePolicy::default(),
             price_table: {
                 // D13 R1 MED: reject any YAML price entry with a non-finite rate so
                 // the resolved table only holds finite prices (the topology price
@@ -1743,14 +1710,6 @@ impl Config {
     /// (T1); the engine no longer pre-merges profile kwargs.
     pub fn global_upstream_chat_kwargs(&self) -> &JsonMap<String, JsonValue> {
         &self.upstream_chat_kwargs
-    }
-
-    /// Always `None`: per-profile native-vision detection is being replaced by
-    /// `image_analysis` (see README "Migrating"). G4 callers still call this
-    /// and fall through to their name-based heuristics.
-    pub fn profile_native_vision(&self, model: &str) -> Option<bool> {
-        let _ = model;
-        None
     }
 
     /// The system-prompt prefix for `request_model`: the global prefix followed

@@ -62,7 +62,6 @@ use crate::upstream::FailoverUpstreamProvider;
 use crate::upstream::ProfileRoutingClient;
 use crate::upstream::ReqwestUpstreamClient;
 use crate::vision::ImageCache;
-use crate::vision::ReqwestVisionClient;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -177,12 +176,12 @@ pub fn build_app_with_gateway_and_options(
     let upstream: Arc<dyn crate::upstream::UpstreamClient> =
         Arc::new(ProfileRoutingClient::new(config_arc, providers));
     let search = Arc::new(BraveSearchClient::new(http_client.clone(), config.clone()));
-    // G4 image agent: a vision client + a shared per-session image cache. The
-    // cache is constructed once and shared so the strip seam (in
-    // `stream_responses`) and the executor (`run_image_analysis`) see the same
-    // store. Construction is unconditional and cheap; gating happens per-turn.
-    let vision: Arc<dyn crate::vision::VisionClient> =
-        Arc::new(ReqwestVisionClient::new(http_client, &config));
+    // G4 image agent: a shared per-session image cache. Constructed once and
+    // shared so the strip seam (in `stream_responses`) and the executor
+    // (`run_image_analysis`) see the same store. The analyzer is dispatched
+    // through the gateway's own upstreams by model name, so no separate vision
+    // client is wired here. Construction is unconditional and cheap; activation
+    // is per-turn on the resolved profile's `image_analysis`.
     let image_cache = Arc::new(ImageCache::from_config(&config));
 
     // D7 dashboard/`/debug` auth, built from the ENVIRONMENT (never from the
@@ -210,7 +209,6 @@ pub fn build_app_with_gateway_and_options(
             replay_store,
             upstream,
             search,
-            vision,
             image_cache,
             monitor,
             raw_output,

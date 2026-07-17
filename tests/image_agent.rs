@@ -1,36 +1,43 @@
-//! G4 — Image agent (vision offload) integration tests.
+//! G4 - Image agent (per-profile vision offload) integration tests.
 //!
-//! The in-proxy vision offload (strip images to `[Image #N]` placeholders, inject
-//! the `analyzeImage` server tool, run it against a vision backend, and feed the
-//! description back into the chat history) is a self-contained topic, so its
-//! suite lives in its own crate here rather than in `tests/gateway.rs`. Shared
-//! gateway/config/request builders and the recording `MockVisionClient` come from
-//! `tests/common`; everything image-agent-specific is asserted below.
+//! A profile that declares `image_analysis` opts its (text-only) backend into
+//! the in-proxy vision offload: images in the latest user turn are stripped to
+//! `[Image #N]` placeholders, cached, and an `analyzeImage` server tool is
+//! injected. When the model calls `analyzeImage`, the engine resolves the cached
+//! image(s) and dispatches them to the analyzer model THROUGH the gateway's own
+//! upstreams (the router resolves that model like any request), then feeds the
+//! description back into the chat history as a tool result. A profile WITHOUT
+//! `image_analysis` is native passthrough: images flow to the upstream untouched.
+//!
+//! Because the analyzer is dispatched over the gateway's own upstreams, the
+//! suite asserts against the mock upstream (or, for the routing test, a second
+//! wiremock server) rather than a dedicated vision-client mock. Shared
+//! gateway/config/request builders live in `tests/common`.
 
 mod common;
 
 use common::MockSearch;
 use common::MockUpstream;
-use common::MockVisionClient;
 use common::TEST_IMAGE_DATA_URL;
 use common::base_request;
 use common::chat_completion_sse_body;
 use common::collect_stream;
 use common::content_chunk;
 use common::event_names;
-use common::image_agent_config;
+use common::image_agent_gateway;
+use common::image_analysis_config;
 use common::test_config;
 use common::test_gateway_with_config;
 use common::test_gateway_with_config_and_replay_store;
-use common::test_gateway_with_vision;
 use common::tool_call_chunk;
 use common::user_message;
 use common::user_message_with_image;
 
 use axum::body::Body;
 use axum::http::Request;
-use futures::StreamExt;
-use llmconduit::config::UnsupportedImagePolicy;
+use axum::http::StatusCode;
+use llmconduit::config::ResidualImagePolicy;
+use llmconduit::error::AppError;
 use llmconduit::models::chat::ChatChunkChoice;
 use llmconduit::models::chat::ChatCompletionChunk;
 use llmconduit::models::chat::ChatDelta;
@@ -44,8 +51,6 @@ use llmconduit::replay::ReplayRecord;
 use llmconduit::replay::ReplayStore;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use std::sync::Arc;
-use tokio::sync::Notify;
 use tower::ServiceExt;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -53,28 +58,45 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
-// ===========================================================================
-// G4 — Image agent (vision offload) integration tests.
-//
-// Shared fixtures (`image_agent_config`, `user_message_with_image`,
-// `TEST_IMAGE_DATA_URL`, `MockVisionClient`, `test_gateway_with_vision`) live in
-// `tests/common`; only the assertions are below.
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// Local helpers.
+// ---------------------------------------------------------------------------
 
-/// Point `config` at a single `primary` upstream at `base` with a `"*"` catch-all
-/// profile - the profile-era replacement for the removed single `upstream_base_url`.
-fn route_all_to(config: &mut llmconduit::config::Config, base: &str) {
-    let routed = common::config_from_yaml(&format!(
-        "upstreams:\n  - name: primary\n    url: \"{base}/v1/\"\nmodel_profiles:\n  \"*\":\n    upstream: primary\n"
-    ));
-    config.upstreams = routed.upstreams;
-    config.model_profiles = routed.model_profiles;
+fn file_id_image(file_id: &str) -> ContentItem {
+    ContentItem::InputImage {
+        image_url: None,
+        file_id: Some(file_id.to_string()),
+        detail: None,
+    }
 }
 
+fn message_with_role_and_image(role: &str, image: ContentItem) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: role.to_string(),
+        content: vec![image],
+        phase: None,
+    }
+}
+
+/// Whether the recorded chat request offers the injected `analyzeImage` tool.
+fn offers_analyze_image(request: &llmconduit::models::chat::ChatCompletionRequest) -> bool {
+    request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"))
+}
+
+// ===========================================================================
+// Active path: a profile WITH `image_analysis` strips + offloads.
+// ===========================================================================
+
 #[tokio::test]
-async fn image_agent_runs_analyze_image_then_answers() {
-    // Round 1: model calls analyzeImage. Round 2: model answers with the
-    // injected vision description. Two upstream calls; analyzeImage never leaks.
+async fn image_analysis_strips_offloads_to_analyzer_then_answers() {
+    // Round 1: the text model calls analyzeImage. The analyzer dispatch (a
+    // normal internal chat request to the `analyzer` model) answers with the
+    // description. Round 2: the text model answers using it. Three upstream
+    // calls; analyzeImage never leaks to the client.
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
@@ -86,17 +108,20 @@ async fn image_agent_runs_analyze_image_then_answers() {
         .await;
     upstream
         .push_response(vec![Ok(content_chunk(
+            "vis-1",
+            "A small red square on white.",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk(
             "chat-2",
             "The image shows a red square.",
         ))])
         .await;
-    let vision = MockVisionClient::default();
-    vision
-        .push_outcome(Ok(llmconduit::vision::VisionOutcome {
-            text: "A small red square on white.".to_string(),
-        }))
-        .await;
-    let gateway = test_gateway_with_vision(upstream.clone(), vision.clone(), image_agent_config());
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
 
     let request = base_request(vec![user_message_with_image(
         "what is this?",
@@ -104,45 +129,50 @@ async fn image_agent_runs_analyze_image_then_answers() {
     )]);
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
-    // Two upstream rounds.
     let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 2, "expected analyze round + answer round");
+    assert_eq!(
+        requests.len(),
+        3,
+        "text round 1 + analyzer dispatch + text round 2"
+    );
 
-    // The vision backend saw the cached image (by url) and the task.
-    let vision_requests = vision.requests().await;
-    assert_eq!(vision_requests.len(), 1);
-    assert_eq!(vision_requests[0].image_ids, vec!["1"]);
-    assert_eq!(vision_requests[0].images.len(), 1);
-    assert_eq!(vision_requests[0].images[0].image_url, TEST_IMAGE_DATA_URL);
+    // Round 1 to the text model carries only the placeholder, never the bytes,
+    // plus the injected analyzeImage tool.
+    let round1 = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(
+        !round1.contains("iVBORw0KGgo"),
+        "raw image base64 must not reach the text model"
+    );
+    assert!(offers_analyze_image(&requests[0]));
 
-    // Round 2 carries the vision description as a tool result.
-    let round2 = &requests[1];
-    let tool_msg = round2
+    // The analyzer dispatch (round 2 recorded) is a chat request to the analyzer
+    // model carrying the raw cached image.
+    assert_eq!(requests[1].model, "analyzer", "analyzer model dispatched");
+    let analyzer_body = serde_json::to_string(&requests[1]).expect("serialize");
+    assert!(
+        analyzer_body.contains("iVBORw0KGgo"),
+        "the analyzer receives the raw cached image: {analyzer_body}"
+    );
+
+    // The text model's continuation (round 3 recorded) carries the description
+    // as a tool result.
+    let tool_msg = requests[2]
         .messages
         .iter()
         .find(|m| m.role == "tool")
-        .expect("vision tool result injected");
-    assert_eq!(
-        tool_msg.content.as_ref().and_then(|v| v.as_str()),
-        Some("A small red square on white.")
-    );
+        .and_then(|m| m.content.as_ref())
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert_eq!(tool_msg, "A small red square on white.");
 
     // analyzeImage never surfaces in the public Responses stream.
     let names = event_names(&events);
-    assert!(
-        !names.contains(&"response.function_call_arguments.delta"),
-        "analyzeImage deltas must be suppressed"
-    );
+    assert!(!names.contains(&"response.function_call_arguments.delta"));
     for event in &events {
         if event["_event"] == "response.output_item.done" {
-            assert_ne!(
-                event["item"]["name"].as_str(),
-                Some("analyzeImage"),
-                "analyzeImage must not appear as an output item"
-            );
+            assert_ne!(event["item"]["name"].as_str(), Some("analyzeImage"));
         }
     }
-    // The final answer is present.
     let answer: String = events
         .iter()
         .filter(|e| e["_event"] == "response.output_text.delta")
@@ -152,20 +182,123 @@ async fn image_agent_runs_analyze_image_then_answers() {
 }
 
 #[tokio::test]
-async fn image_agent_strips_raw_image_bytes_from_upstream() {
-    // The text backend must NEVER receive the raw image bytes: round 1 carries
-    // only the [Image #N] placeholder, and the injected analyzeImage tool.
+async fn analysis_call_lands_on_analyzer_profile_upstream_with_served_model() {
+    // The single required routing assertion (controller 5a): the analyzeImage
+    // call is dispatched through the gateway's own upstreams by the analyzer
+    // profile's model name, so it lands on the ANALYZER profile's upstream and
+    // posts that profile's served model. Two independent wiremock servers.
+    let text_server = MockServer::start().await;
+    // Round 1 on the text upstream: emit an analyzeImage tool call.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "tool_calls": [{
+                            "id": "call_img_1",
+                            "index": 0,
+                            "type": "function",
+                            "function": {
+                                "name": "analyzeImage",
+                                "arguments": "{\"imageId\":[\"1\"],\"task\":\"describe\"}"
+                            }
+                        }]},
+                        "finish_reason": "tool_calls"
+                    }]
+                })])),
+        )
+        .up_to_n_times(1)
+        .mount(&text_server)
+        .await;
+    // Round 2 on the text upstream: the final answer.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-2",
+                    "choices": [{"index": 0, "delta": {"content": "It is a red square."}, "finish_reason": "stop"}]
+                })])),
+        )
+        .mount(&text_server)
+        .await;
+
+    let vision_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "vis-1",
+                    "choices": [{"index": 0, "delta": {"content": "A red square."}, "finish_reason": "stop"}]
+                })])),
+        )
+        .mount(&vision_server)
+        .await;
+
+    let config = common::config_from_yaml(&format!(
+        "upstreams:\n  \
+           - name: text_up\n    url: \"{text}/v1/\"\n  \
+           - name: vision_up\n    url: \"{vision}/v1/\"\n\
+         model_profiles:\n  \
+           \"glm-5.1\":\n    upstream: text_up\n    image_analysis:\n      model: \"vision-analyzer\"\n  \
+           \"vision-analyzer\":\n    upstream: vision_up\n    upstream_model: \"served-vision-model\"\n",
+        text = text_server.uri(),
+        vision = vision_server.uri(),
+    ));
+    let (_app, gateway) = llmconduit::build_app_with_gateway(config);
+
+    let request = base_request(vec![user_message_with_image(
+        "what is this?",
+        TEST_IMAGE_DATA_URL,
+    )]);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    // Filter to chat-completions POSTs: the routing client may also probe
+    // `/v1/models` on the upstream, which is not the analysis call.
+    let analyzer_posts: Vec<_> = vision_server
+        .received_requests()
+        .await
+        .expect("vision server recorded requests")
+        .into_iter()
+        .filter(|req| req.url.path().ends_with("/chat/completions"))
+        .collect();
+    assert_eq!(
+        analyzer_posts.len(),
+        1,
+        "the analyzer upstream serves the analysis call exactly once"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&analyzer_posts[0].body).expect("analyzer body is JSON");
+    assert_eq!(
+        body["model"].as_str(),
+        Some("served-vision-model"),
+        "the analyzer profile's served model is posted"
+    );
+    let body_text = serde_json::to_string(&body).expect("serialize");
+    assert!(
+        body_text.contains("iVBORw0KGgo"),
+        "the analyzer upstream receives the raw image: {body_text}"
+    );
+}
+
+#[tokio::test]
+async fn image_analysis_strips_raw_image_bytes_from_upstream() {
+    // The text backend must NEVER receive raw image bytes: round 1 carries only
+    // the [Image #N] placeholder plus the injected analyzeImage tool.
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk(
-            "chat-1",
-            "I cannot see images directly.",
-        ))])
+        .push_response(vec![Ok(content_chunk("chat-1", "I cannot see images."))])
         .await;
-    let gateway = test_gateway_with_vision(
+    let gateway = image_agent_gateway(
         upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
     );
 
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
@@ -177,29 +310,12 @@ async fn image_agent_strips_raw_image_bytes_from_upstream() {
         !serialized.contains("iVBORw0KGgo"),
         "raw image base64 must not reach the text upstream"
     );
-    assert!(
-        serialized.contains("[Image #1]"),
-        "placeholder must be present"
-    );
-    // The analyzeImage tool was injected for the text backend.
-    let tools = requests[0].tools.as_ref().expect("tools present");
-    assert!(
-        tools.iter().any(|t| t.function.name == "analyzeImage"),
-        "analyzeImage tool injected"
-    );
-    // System prompt instructs the model about [Image #N].
-    let system = requests[0]
-        .messages
-        .iter()
-        .find(|m| m.role == "system")
-        .and_then(|m| m.content.as_ref())
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    assert!(system.contains("You CANNOT see images"));
+    assert!(serialized.contains("[Image #1]"), "placeholder present");
+    assert!(offers_analyze_image(&requests[0]));
 }
 
 #[tokio::test]
-async fn image_agent_handles_multiple_image_ids() {
+async fn image_analysis_handles_multiple_image_ids() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
@@ -210,10 +326,15 @@ async fn image_agent_handles_multiple_image_ids() {
         ))])
         .await;
     upstream
+        .push_response(vec![Ok(content_chunk("vis-1", "They differ."))])
+        .await;
+    upstream
         .push_response(vec![Ok(content_chunk("chat-2", "Both differ."))])
         .await;
-    let vision = MockVisionClient::default();
-    let gateway = test_gateway_with_vision(upstream.clone(), vision.clone(), image_agent_config());
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
 
     let request = base_request(vec![ResponseItem::Message {
         id: None,
@@ -223,12 +344,12 @@ async fn image_agent_handles_multiple_image_ids() {
                 text: "compare".to_string(),
             },
             ContentItem::InputImage {
-                image_url: Some("data:image/png;base64,AAAA".to_string()),
+                image_url: Some("data:image/png;base64,AAAAMARKER".to_string()),
                 file_id: None,
                 detail: None,
             },
             ContentItem::InputImage {
-                image_url: Some("data:image/png;base64,BBBB".to_string()),
+                image_url: Some("data:image/png;base64,BBBBMARKER".to_string()),
                 file_id: None,
                 detail: None,
             },
@@ -237,64 +358,18 @@ async fn image_agent_handles_multiple_image_ids() {
     }]);
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
-    let vision_requests = vision.requests().await;
-    assert_eq!(vision_requests[0].image_ids, vec!["1", "2"]);
-    assert_eq!(vision_requests[0].images.len(), 2);
-    assert_eq!(
-        vision_requests[0].images[0].image_url,
-        "data:image/png;base64,AAAA"
-    );
-    assert_eq!(
-        vision_requests[0].images[1].image_url,
-        "data:image/png;base64,BBBB"
-    );
-}
-
-#[tokio::test]
-async fn image_agent_vision_error_becomes_model_visible_text() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(tool_call_chunk(
-            "chat-1",
-            "call_img_1",
-            "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
-        ))])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "Sorry, no image."))])
-        .await;
-    let vision = MockVisionClient::default();
-    vision
-        .push_outcome(Err(llmconduit::error::AppError::upstream(
-            "backend exploded",
-        )))
-        .await;
-    let gateway = test_gateway_with_vision(upstream.clone(), vision, image_agent_config());
-
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-
-    // Turn still completes (no response.failed).
-    let names = event_names(&events);
-    assert!(names.contains(&"response.completed"));
-    assert!(!names.contains(&"response.failed"));
-    // Round 2 tool result carries the failure text.
+    // The analyzer dispatch (recorded second) carries BOTH cached images.
     let requests = upstream.requests().await;
-    let tool_msg = requests[1]
-        .messages
-        .iter()
-        .find(|m| m.role == "tool")
-        .and_then(|m| m.content.as_ref())
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    assert!(tool_msg.contains("Vision analysis failed"));
+    let analyzer_body = serde_json::to_string(&requests[1]).expect("serialize");
+    assert!(analyzer_body.contains("AAAAMARKER"));
+    assert!(analyzer_body.contains("BBBBMARKER"));
 }
 
 #[tokio::test]
-async fn image_agent_cache_miss_becomes_model_visible_text() {
-    // Model asks for an image id that was never cached (e.g. #5 when only #1
-    // exists). The executor injects a "no cached image" message, not an error.
+async fn image_analysis_cache_miss_becomes_model_visible_text() {
+    // The model asks for an image id that was never cached (#5 when only #1
+    // exists). The executor injects a "no cached image" message and never
+    // dispatches the analyzer, so there are only two upstream calls.
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
@@ -307,16 +382,17 @@ async fn image_agent_cache_miss_becomes_model_visible_text() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-2", "ok"))])
         .await;
-    let vision = MockVisionClient::default();
-    let gateway = test_gateway_with_vision(upstream.clone(), vision.clone(), image_agent_config());
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
 
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
     assert!(event_names(&events).contains(&"response.completed"));
-    // Vision backend was never called (no image resolved).
-    assert!(vision.requests().await.is_empty());
     let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2, "analyzer not dispatched on a cache miss");
     let tool_msg = requests[1]
         .messages
         .iter()
@@ -328,7 +404,9 @@ async fn image_agent_cache_miss_becomes_model_visible_text() {
 }
 
 #[tokio::test]
-async fn image_agent_vision_timeout_becomes_model_visible_text() {
+async fn analyzer_failure_surfaces_as_tool_result_error_without_killing_turn() {
+    // Controller 5e: an analyzer dispatch failure degrades to model-visible tool
+    // text (matching the Brave web_search contract) so the turn still completes.
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
@@ -338,35 +416,42 @@ async fn image_agent_vision_timeout_becomes_model_visible_text() {
             "{\"imageId\":[\"1\"],\"task\":\"x\"}",
         ))])
         .await;
+    // The analyzer dispatch stream yields an error.
     upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "done"))])
+        .push_response(vec![Err(AppError::upstream("analyzer backend exploded"))])
         .await;
-    let vision = MockVisionClient::default();
-    // Block the vision call forever; a tiny request_timeout forces a timeout.
-    vision.block_on(Arc::new(Notify::new())).await;
-    let mut config = image_agent_config();
-    config.request_timeout = std::time::Duration::from_millis(50);
-    let gateway = test_gateway_with_vision(upstream.clone(), vision, config);
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "Sorry, no image."))])
+        .await;
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
 
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
-    assert!(event_names(&events).contains(&"response.completed"));
+    let names = event_names(&events);
+    assert!(names.contains(&"response.completed"));
+    assert!(!names.contains(&"response.failed"), "turn must not fail");
     let requests = upstream.requests().await;
-    let tool_msg = requests[1]
+    let tool_msg = requests[2]
         .messages
         .iter()
         .find(|m| m.role == "tool")
         .and_then(|m| m.content.as_ref())
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    assert!(tool_msg.contains("timed out"));
+    assert!(
+        tool_msg.contains("Vision analysis failed"),
+        "analyzer failure becomes model-visible tool text: {tool_msg}"
+    );
 }
 
 #[tokio::test]
-async fn image_agent_cancellation_drops_vision_work() {
-    // Client disconnects while the vision call is blocked: the turn must cancel
-    // (drop the receiver) instead of hanging on the vision future.
+async fn image_analysis_redacts_data_url_in_successful_analyzer_text() {
+    // A SUCCESSFUL analyzer description that echoes a data:/signed URL must be
+    // redacted before it is injected as the tool result (and logged).
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
@@ -376,315 +461,59 @@ async fn image_agent_cancellation_drops_vision_work() {
             "{\"imageId\":[\"1\"],\"task\":\"x\"}",
         ))])
         .await;
-    let vision = MockVisionClient::default();
-    vision.block_on(Arc::new(Notify::new())).await;
-    let gateway = test_gateway_with_vision(upstream.clone(), vision.clone(), image_agent_config());
+    upstream
+        .push_response(vec![Ok(content_chunk(
+            "vis-1",
+            "It shows data:image/png;base64,LEAKEDB64 and a logo at https://signed.example.com/x?sig=LEAKEDSIG",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "Done."))])
+        .await;
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
 
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let mut stream = gateway.stream_responses(request).await.expect("stream");
-    // Capture both `notified()` futures UP FRONT — before the actions that fire
-    // them — because `notify_waiters()` stores no permit and a future created
-    // after its trigger would miss the wake and hang to the 1s timeout.
-    let entered = vision.entered();
-    let dropped = vision.dropped();
-    // Drain the prologue, then await the vision future actually starting (its
-    // request already recorded) before dropping the stream.
-    let _ = stream.next().await;
-    let _ = stream.next().await;
-    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
-        .await
-        .expect("vision analyze should have been entered");
-    drop(stream);
-    // Await the spawned turn reacting to the closed channel: the blocked vision
-    // future is dropped, firing the drop-guard signal. No wall-clock sleep.
-    tokio::time::timeout(std::time::Duration::from_secs(1), dropped)
-        .await
-        .expect("vision work should be dropped after client disconnect");
-    // Vision was entered but the turn was cancelled; no panic / hang.
-    assert_eq!(vision.requests().await.len(), 1);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let tool_msg = requests[2]
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .and_then(|m| m.content.as_ref())
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(!tool_msg.contains("LEAKEDB64"));
+    assert!(!tool_msg.contains("LEAKEDSIG"));
+    assert!(tool_msg.contains("<redacted uri>"));
 }
 
 #[tokio::test]
-async fn image_agent_not_leaked_in_chat_completions() {
-    // Through the Chat ingress/egress, analyzeImage must be hidden end to end.
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(tool_call_chunk(
-            "chat-1",
-            "call_img_1",
-            "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
-        ))])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "A cat."))])
-        .await;
-    let vision = MockVisionClient::default();
-    let gateway = test_gateway_with_vision(upstream.clone(), vision, image_agent_config());
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "glm-5.1",
-        "stream": true,
-        "messages": [{
-            "role": "user",
-            "content": [
-                { "type": "text", "text": "what is this?" },
-                { "type": "image_url", "image_url": { "url": TEST_IMAGE_DATA_URL } }
-            ]
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status().as_u16(), 200);
-    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-        .await
-        .expect("body");
-    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(
-        !text.contains("analyzeImage"),
-        "analyzeImage must not leak to Chat"
-    );
-    assert!(text.contains("A cat."));
-}
-
-#[tokio::test]
-async fn image_agent_not_leaked_in_anthropic_messages() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(tool_call_chunk(
-            "chat-1",
-            "call_img_1",
-            "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
-        ))])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "A dog."))])
-        .await;
-    let vision = MockVisionClient::default();
-    let gateway = test_gateway_with_vision(upstream.clone(), vision, image_agent_config());
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "glm-5.1",
-        "max_tokens": 1024,
-        "stream": true,
-        "messages": [{
-            "role": "user",
-            "content": [
-                { "type": "text", "text": "what is this?" },
-                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA=" } }
-            ]
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status().as_u16(), 200);
-    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-        .await
-        .expect("body");
-    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(
-        !text.contains("analyzeImage"),
-        "analyzeImage must not leak to Anthropic"
-    );
-    assert!(
-        !text.contains("tool_use"),
-        "no tool_use block for the internal tool"
-    );
-    assert!(text.contains("A dog."));
-}
-
-#[tokio::test]
-async fn image_agent_keeps_parallel_tool_calls_false_upstream() {
+async fn image_analysis_keeps_parallel_tool_calls_false_upstream() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "no images visible"))])
         .await;
-    let gateway = test_gateway_with_vision(
+    let gateway = image_agent_gateway(
         upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
     );
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
-    assert!(
-        requests[0].parallel_tool_calls == Some(false),
-        "parallel_tool_calls must stay false"
-    );
-}
-
-// --- Gating ---
-
-#[tokio::test]
-async fn image_agent_skips_when_disabled() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
-        .await;
-    let mut config = image_agent_config();
-    config.image_agent_enabled = false;
-    let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    // No analyzeImage tool injected; raw image flows through.
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(!has_analyze, "disabled agent must not inject analyzeImage");
-}
-
-#[tokio::test]
-async fn image_agent_skips_when_vision_url_missing() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
-        .await;
-    let mut config = image_agent_config();
-    config.vision_url = None;
-    let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(!has_analyze, "missing vision_url must skip the agent");
-}
-
-#[tokio::test]
-async fn image_agent_skips_when_no_image_in_latest_turn() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    // Text-only latest turn.
-    let request = base_request(vec![user_message("just text")]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(!has_analyze, "no-image turn must skip the agent");
-}
-
-#[tokio::test]
-async fn image_agent_skips_for_native_vision_kimi() {
-    // The resolved model is Kimi (native-vision), so the agent must not strip;
-    // the raw image flows to the multimodal backend.
-    let upstream = MockUpstream::default();
-    upstream.set_supported_models(["Kimi-K2.6"]).await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "I see a square."))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.model = "Kimi-K2.6".to_string();
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(
-        serialized.contains("iVBORw0KGgo"),
-        "native-vision Kimi must receive the raw image"
-    );
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(
-        !has_analyze,
-        "native-vision backend must not get analyzeImage"
+    assert_eq!(
+        requests[0].parallel_tool_calls,
+        Some(false),
+        "parallel_tool_calls must stay false for the gateway-owned server tool"
     );
 }
 
 #[tokio::test]
-async fn image_agent_used_for_text_backend_with_images() {
-    // A non-Kimi text backend WITH images activates the agent (contrast to the
-    // Kimi skip test): analyzeImage is injected and bytes are stripped.
-    let upstream = MockUpstream::default();
-    upstream.set_supported_models(["deepseek-v3"]).await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.model = "deepseek-v3".to_string();
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(
-        has_analyze,
-        "text backend with images must activate the agent"
-    );
-}
-
-#[tokio::test]
-async fn image_agent_skips_when_tool_choice_none() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.tool_choice = json!("none");
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(!has_analyze, "tool_choice=none must skip the agent");
-}
-
-// --- Hard rules: mixed tools, server batch, round ceiling ---
-
-#[tokio::test]
-async fn image_agent_rejects_mixed_client_and_analyze_image() {
-    // analyzeImage (server) + a client function tool in the same batch must be
+async fn image_analysis_rejects_mixed_client_and_analyze_image() {
+    // analyzeImage (server) + a client function tool in the same batch is
     // rejected, exactly like web_search + client.
     let upstream = MockUpstream::default();
     upstream
@@ -727,10 +556,9 @@ async fn image_agent_rejects_mixed_client_and_analyze_image() {
             usage: None,
         })])
         .await;
-    let gateway = test_gateway_with_vision(
+    let gateway = image_agent_gateway(
         upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
     );
     let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     request.tools = vec![ToolSpec::Function {
@@ -747,276 +575,80 @@ async fn image_agent_rejects_mixed_client_and_analyze_image() {
 }
 
 #[tokio::test]
-async fn image_agent_runs_analyze_and_web_search_sequentially() {
-    // A server-only batch mixing analyzeImage + web_search runs both tools
-    // sequentially, then the model answers.
+async fn image_analysis_not_leaked_in_chat_completions() {
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(ChatCompletionChunk {
-            id: "chat-1".to_string(),
-            choices: vec![ChatChunkChoice {
-                index: 0,
-                delta: ChatDelta {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![
-                        ChatToolCall {
-                            id: Some("call_img".to_string()),
-                            index: Some(0),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: Some("analyzeImage".to_string()),
-                                arguments: Some(serde_json::Value::String(
-                                    "{\"imageId\":[\"1\"],\"task\":\"x\"}".to_string(),
-                                )),
-                            },
-                        },
-                        ChatToolCall {
-                            id: Some("call_ws".to_string()),
-                            index: Some(1),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: Some("web_search".to_string()),
-                                arguments: Some(serde_json::Value::String(
-                                    "{\"query\":\"latest\"}".to_string(),
-                                )),
-                            },
-                        },
-                    ]),
-                    function_call: None,
-                    refusal: None,
-                    extra: Default::default(),
-                },
-                finish_reason: Some("tool_calls".to_string()),
-                stop_reason: None,
-            }],
-            usage: None,
-        })])
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
+        ))])
         .await;
     upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "answer"))])
+        .push_response(vec![Ok(content_chunk("vis-1", "A cat."))])
         .await;
-    let vision = MockVisionClient::default();
-    // Brave must be configured for web_search to be server-runnable.
-    let mut config = image_agent_config();
-    config.brave_api_key = Some("test-key".to_string());
-    let gateway = test_gateway_with_vision(upstream.clone(), vision.clone(), config);
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.tools = vec![ToolSpec::WebSearch {
-        external_web_access: Some(true),
-        filters: None,
-        user_location: None,
-        search_context_size: None,
-        search_content_types: None,
-    }];
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    assert!(event_names(&events).contains(&"response.completed"));
-    // Vision ran once.
-    assert_eq!(vision.requests().await.len(), 1);
-    // Round 2 has both a vision tool result and a web_search tool result.
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 2);
-    let tool_contents: Vec<String> = requests[1]
-        .messages
-        .iter()
-        .filter(|m| m.role == "tool")
-        .filter_map(|m| {
-            m.content
-                .as_ref()
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string)
-        })
-        .collect();
-    assert!(
-        tool_contents
-            .iter()
-            .any(|c| c.contains("Search result for latest"))
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "A cat."))])
+        .await;
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
     );
-    assert_eq!(tool_contents.len(), 2, "both server tools injected results");
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image_url", "image_url": { "url": TEST_IMAGE_DATA_URL } }
+            ]
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(!text.contains("analyzeImage"), "analyzeImage must not leak");
+    assert!(text.contains("A cat."));
 }
 
 #[tokio::test]
-async fn image_agent_round_ceiling_terminates_loop() {
-    // A model that calls analyzeImage every round must hit the round ceiling and
-    // error out rather than loop forever. Queue many analyzeImage rounds.
+async fn image_analysis_not_leaked_in_anthropic_messages() {
     let upstream = MockUpstream::default();
-    for n in 0..12 {
-        upstream
-            .push_response(vec![Ok(tool_call_chunk(
-                &format!("chat-{n}"),
-                &format!("call_img_{n}"),
-                "analyzeImage",
-                "{\"imageId\":[\"1\"],\"task\":\"x\"}",
-            ))])
-            .await;
-    }
-    let vision = MockVisionClient::default();
-    let gateway = test_gateway_with_vision(upstream.clone(), vision, image_agent_config());
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    assert!(
-        event_names(&events).contains(&"response.failed"),
-        "image-analysis round ceiling must terminate the loop"
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("vis-1", "A dog."))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "A dog."))])
+        .await;
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
     );
-}
-
-#[tokio::test]
-async fn image_agent_hides_analyze_deltas_when_args_precede_name_chat() {
-    // Review #1: a sparse upstream can stream analyzeImage `arguments` BEFORE the
-    // function name. The leading arg fragment must be buffered and dropped, so
-    // ZERO function_call_arguments deltas reach the Chat client.
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![
-            // Chunk 1: arguments only, no name, no id.
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: Some(vec![ChatToolCall {
-                            id: None,
-                            index: Some(0),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: None,
-                                arguments: Some(serde_json::Value::String(
-                                    "{\"imageId\":[\"1\"]".to_string(),
-                                )),
-                            },
-                        }]),
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: None,
-                    stop_reason: None,
-                }],
-                usage: None,
-            }),
-            // Chunk 2: name (+ id) arrives with the rest of the arguments.
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: Some(vec![ChatToolCall {
-                            id: Some("call_img_1".to_string()),
-                            index: Some(0),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: Some("analyzeImage".to_string()),
-                                arguments: Some(serde_json::Value::String(
-                                    ",\"task\":\"x\"}".to_string(),
-                                )),
-                            },
-                        }]),
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: Some("tool_calls".to_string()),
-                    stop_reason: None,
-                }],
-                usage: None,
-            }),
-        ])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "A leaf."))])
-        .await;
-    let vision = MockVisionClient::default();
-    let gateway = test_gateway_with_vision(upstream.clone(), vision.clone(), image_agent_config());
-
-    // Direct Responses stream: assert no function_call_arguments deltas at all.
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let delta_count = events
-        .iter()
-        .filter(|e| e["_event"] == "response.function_call_arguments.delta")
-        .count();
-    assert_eq!(
-        delta_count, 0,
-        "no analyzeImage arg deltas may leak (Responses)"
-    );
-    // The vision call still received the FULL reconstructed arguments.
-    let vision_requests = vision.requests().await;
-    assert_eq!(vision_requests[0].image_ids, vec!["1"]);
-    assert_eq!(vision_requests[0].task, "x");
-}
-
-#[tokio::test]
-async fn image_agent_hides_analyze_deltas_when_args_precede_name_anthropic() {
-    // Same sparse ordering, but through the Anthropic egress: no tool_use block
-    // and no input_json_delta for the internal analyzeImage tool.
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: Some(vec![ChatToolCall {
-                            id: None,
-                            index: Some(0),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: None,
-                                arguments: Some(serde_json::Value::String(
-                                    "{\"imageId\":[\"1\"]".to_string(),
-                                )),
-                            },
-                        }]),
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: None,
-                    stop_reason: None,
-                }],
-                usage: None,
-            }),
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: Some(vec![ChatToolCall {
-                            id: Some("call_img_1".to_string()),
-                            index: Some(0),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: Some("analyzeImage".to_string()),
-                                arguments: Some(serde_json::Value::String(
-                                    ",\"task\":\"x\"}".to_string(),
-                                )),
-                            },
-                        }]),
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: Some("tool_calls".to_string()),
-                    stop_reason: None,
-                }],
-                usage: None,
-            }),
-        ])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "A leaf."))])
-        .await;
-    let vision = MockVisionClient::default();
-    let gateway = test_gateway_with_vision(upstream.clone(), vision, image_agent_config());
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
@@ -1047,399 +679,128 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_anthropic() {
         .await
         .expect("body");
     let text = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(
-        !text.contains("analyzeImage"),
-        "no analyzeImage in Anthropic output"
-    );
-    assert!(
-        !text.contains("input_json_delta"),
-        "no tool args streamed for analyzeImage"
-    );
+    assert!(!text.contains("analyzeImage"), "analyzeImage must not leak");
     assert!(
         !text.contains("tool_use"),
-        "no tool_use block for analyzeImage"
+        "no tool_use block for the internal tool"
     );
-    assert!(text.contains("A leaf."));
+    assert!(text.contains("A dog."));
 }
 
+// ===========================================================================
+// Passthrough: a profile WITHOUT `image_analysis` never mutates the request.
+// ===========================================================================
+
 #[tokio::test]
-async fn image_agent_passes_through_when_all_failover_candidates_native() {
-    // Round-2 #1 (safe invariant): EVERY candidate backend model is native-
-    // vision (both Kimi variants), so images pass through unstripped and no
-    // analyzeImage tool is injected.
+async fn no_image_analysis_passes_data_url_through_unmodified() {
+    // Controller 5b: a profile with no `image_analysis` is native passthrough.
+    // The data-URL image reaches the profile's upstream UNMODIFIED, even though
+    // the model name ("glm-5.1") is not a known vision model - the name sniff is
+    // gone.
     let upstream = MockUpstream::default();
-    upstream.set_candidate_models(["Kimi-K2.6", "kimi-vl-a3b"]);
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "I see a square."))])
+        .push_response(vec![Ok(content_chunk("chat-1", "I can see it."))])
         .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
+    // `test_config()`'s catch-all profile declares no `image_analysis`.
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
     let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1, "single passthrough round");
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(
         serialized.contains("iVBORw0KGgo"),
-        "all-native failover chain must receive the raw image"
+        "the raw image survives to the upstream unmodified: {serialized}"
     );
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
     assert!(
-        !has_analyze,
-        "all-native chain must not inject analyzeImage"
+        !serialized.contains("[Image #1]"),
+        "no placeholder rewrite on the passthrough path"
+    );
+    assert!(
+        !offers_analyze_image(&requests[0]),
+        "passthrough must not inject analyzeImage"
     );
 }
 
 #[tokio::test]
-async fn image_agent_strips_when_any_failover_candidate_is_non_native() {
-    // Round-2 #1: the primary is native (Kimi) but a fallback is a text-only
-    // model. The SAFE invariant must strip+offload (works for every backend),
-    // since the request could be served by the non-native fallback.
+async fn image_analysis_skips_when_no_image_present() {
+    // A pure-text turn to an `image_analysis` profile must NOT be saddled with
+    // the analyzeImage tool + mandatory-analyze system prompt.
     let upstream = MockUpstream::default();
-    upstream.set_candidate_models(["Kimi-K2.6", "deepseek-v3"]);
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "cannot see images"))])
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_vision(
+    let gateway = image_agent_gateway(
         upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
     );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    let request = base_request(vec![user_message("just text")]);
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(
-        !serialized.contains("iVBORw0KGgo"),
-        "a non-native fallback must force strip+offload"
+        !offers_analyze_image(&requests[0]),
+        "no-image turn must not activate the agent"
     );
-    assert!(serialized.contains("[Image #1]"), "placeholder present");
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(has_analyze, "mixed chain must inject analyzeImage");
 }
 
+// ===========================================================================
+// Residual sweep: policy from the profile's `image_analysis.residual_images`.
+// Only images the strip did not consume (file_id, non-user role, old history).
+// ===========================================================================
+
 #[tokio::test]
-async fn image_agent_oversized_unresolved_tool_buffer_fails_cleanly() {
-    // Round-2 #4 (DoS guard): the upstream streams a huge analyzeImage argument
-    // run WITHOUT ever sending the tool name. The pending buffer is capped, so
-    // the turn fails cleanly (response.failed) instead of growing memory.
+async fn reject_policy_file_id_in_old_history_fails_4xx_before_dispatch() {
+    // Controller 5c: with `residual_images: reject`, a `file_id` image in older
+    // history (the active strip only rewrites `image_url` user images) fails the
+    // turn with a 4xx BEFORE any upstream call.
     let upstream = MockUpstream::default();
-    // ~1.5 MiB of args across many nameless chunks for one tool-call index.
-    let mut chunks = Vec::new();
-    for i in 0..192 {
-        chunks.push(Ok(ChatCompletionChunk {
-            id: "chat-1".to_string(),
-            choices: vec![ChatChunkChoice {
-                index: 0,
-                delta: ChatDelta {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![ChatToolCall {
-                        id: None,
-                        index: Some(0),
-                        kind: "function".to_string(),
-                        function: ChatFunctionCall {
-                            name: None, // name NEVER arrives
-                            arguments: Some(serde_json::Value::String("x".repeat(8 * 1024))),
-                        },
-                    }]),
-                    function_call: None,
-                    refusal: None,
-                    extra: Default::default(),
-                },
-                finish_reason: if i == 191 {
-                    Some("tool_calls".to_string())
-                } else {
-                    None
-                },
-                stop_reason: None,
-            }],
-            usage: None,
-        }));
-    }
-    upstream.push_response(chunks).await;
-    let gateway = test_gateway_with_vision(
+    let gateway = image_agent_gateway(
         upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
+        image_analysis_config(ResidualImagePolicy::Reject),
     );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let request = base_request(vec![
+        message_with_role_and_image("user", file_id_image("file-old-abc123")),
+        ResponseItem::message_text("assistant", "ok"),
+        user_message("what was that?"),
+    ]);
+    let err = gateway
+        .stream_responses(request)
+        .await
+        .expect_err("reject must fail the turn");
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
     assert!(
-        event_names(&events).contains(&"response.failed"),
-        "oversized unresolved tool buffer must fail the turn cleanly"
+        err.to_string().contains("text-only"),
+        "message names the text-only backend: {err}"
+    );
+    assert!(
+        upstream.requests().await.is_empty(),
+        "the provider must never be contacted on Reject"
     );
 }
 
 #[tokio::test]
-async fn image_agent_client_tool_args_before_name_still_emits_all_deltas() {
-    // Round-2 #5: a CLIENT tool whose arguments stream before its name (name
-    // arrives name-only, no further arg delta) must still have all its buffered
-    // deltas flushed — only analyzeImage is dropped. Image agent active.
+async fn reject_policy_responses_ingress_returns_4xx_not_502() {
+    // The Reject 4xx surfaces as a structured error through the /v1/responses
+    // ingress, never a 502 (the provider is not contacted, so never cooled).
     let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![
-            // Chunk 1: client tool args only, no name, no id.
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: Some(vec![ChatToolCall {
-                            id: None,
-                            index: Some(0),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: None,
-                                arguments: Some(serde_json::Value::String(
-                                    "{\"location\":".to_string(),
-                                )),
-                            },
-                        }]),
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: None,
-                    stop_reason: None,
-                }],
-                usage: None,
-            }),
-            // Chunk 2: NAME-ONLY (+ id) — no arguments, so no delta is produced
-            // by the resolution path; the post-stream flush must emit chunk 1.
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: Some(vec![ChatToolCall {
-                            id: Some("call_fn_1".to_string()),
-                            index: Some(0),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: Some("get_weather".to_string()),
-                                arguments: None,
-                            },
-                        }]),
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: None,
-                    stop_reason: None,
-                }],
-                usage: None,
-            }),
-            // Chunk 3: remaining client args (resolved → emitted live).
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: Some(vec![ChatToolCall {
-                            id: Some("call_fn_1".to_string()),
-                            index: Some(0),
-                            kind: "function".to_string(),
-                            function: ChatFunctionCall {
-                                name: Some("get_weather".to_string()),
-                                arguments: Some(serde_json::Value::String(
-                                    "\"Seattle\"}".to_string(),
-                                )),
-                            },
-                        }]),
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: Some("tool_calls".to_string()),
-                    stop_reason: None,
-                }],
-                usage: None,
-            }),
-        ])
-        .await;
-    let gateway = test_gateway_with_vision(
+    let gateway = image_agent_gateway(
         upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
+        image_analysis_config(ResidualImagePolicy::Reject),
     );
-    // A client tool is defined; image in the latest turn activates the agent.
-    let mut request = base_request(vec![user_message_with_image(
-        "weather?",
-        TEST_IMAGE_DATA_URL,
-    )]);
-    request.tools = vec![ToolSpec::Function {
-        name: "get_weather".to_string(),
-        description: "d".to_string(),
-        strict: false,
-        parameters: json!({"type": "object", "properties": {"location": {"type": "string"}}}),
-    }];
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    // The full client-tool arguments must be reconstructible from the deltas:
-    // chunk1 `{"location":` (buffered, flushed) + chunk3 `"Seattle"}` (live).
-    let streamed: String = events
-        .iter()
-        .filter(|e| e["_event"] == "response.function_call_arguments.delta")
-        .filter_map(|e| e["delta"].as_str())
-        .collect();
-    assert_eq!(
-        streamed, "{\"location\":\"Seattle\"}",
-        "all client-tool arg deltas must be emitted, including the pre-name buffer"
-    );
-}
-
-#[tokio::test]
-async fn image_agent_strips_when_candidate_set_is_empty() {
-    // Round-3 #1: an EMPTY candidate set (unknown routing/catalog state) must
-    // NOT pass raw images through, even if the request model looks native.
-    let upstream = MockUpstream::default();
-    upstream.set_candidate_models(Vec::<String>::new());
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    // Even a Kimi-looking request model must strip when candidates are unknown.
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.model = "Kimi-K2.6".to_string();
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(
-        !serialized.contains("iVBORw0KGgo"),
-        "empty candidate set must force strip+offload"
-    );
-    let has_analyze = requests[0]
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
-    assert!(has_analyze, "empty candidate set must inject analyzeImage");
-}
-
-#[tokio::test]
-async fn image_agent_redacts_data_url_in_successful_vision_text() {
-    // Round-3 #3: a SUCCESSFUL vision description that echoes a data:/signed URL
-    // must be redacted before it is injected as the tool result (and logged).
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(tool_call_chunk(
-            "chat-1",
-            "call_img_1",
-            "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
-        ))])
-        .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "Done."))])
-        .await;
-    let vision = MockVisionClient::default();
-    vision
-        .push_outcome(Ok(llmconduit::vision::VisionOutcome {
-            text: "It shows data:image/png;base64,LEAKEDB64 and a logo at https://signed.example.com/x?sig=LEAKEDSIG".to_string(),
-        }))
-        .await;
-    let gateway = test_gateway_with_vision(upstream.clone(), vision, image_agent_config());
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let tool_msg = requests[1]
-        .messages
-        .iter()
-        .find(|m| m.role == "tool")
-        .and_then(|m| m.content.as_ref())
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    assert!(
-        !tool_msg.contains("LEAKEDB64"),
-        "data: payload redacted from success text"
-    );
-    assert!(
-        !tool_msg.contains("LEAKEDSIG"),
-        "signed-url token redacted from success text"
-    );
-    assert!(tool_msg.contains("<redacted uri>"));
-    // And it definitely did not reach the upstream as raw bytes anywhere.
-    let serialized = serde_json::to_string(&requests[1]).expect("serialize");
-    assert!(!serialized.contains("LEAKEDB64"));
-    assert!(!serialized.contains("LEAKEDSIG"));
-}
-
-#[tokio::test]
-async fn upstream_request_log_redacts_image_data_when_agent_disabled() {
-    // Round-4 #3: with the image agent OFF, the raw image flows to the upstream,
-    // but the on-disk JSONL request log must NOT contain the raw data: bytes.
-    use std::io::Read;
-    let log_dir = std::env::temp_dir().join(format!(
-        "llmconduit-img-log-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&log_dir).expect("mkdir");
-    let log_path = log_dir.join("upstream.jsonl");
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "object": "list",
-            "data": [{ "id": "kimi-text-model", "object": "model" }]
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(chat_completion_sse_body(&[json!({
-                    "id": "chat-1",
-                    "choices": [{ "index": 0, "delta": { "content": "ok" }, "finish_reason": "stop" }]
-                })])),
-        )
-        .mount(&server)
-        .await;
-
-    let mut config = test_config();
-    config.brave_api_key = None;
-    config.image_agent_enabled = false; // agent OFF
-    // E2b: with the agent off AND a non-native backend, the engine's residual-
-    // image pass now degrades the image to a text placeholder BEFORE it ever
-    // reaches the upstream request/log -- there would be no raw URI left to
-    // redact. The model is Kimi-recognized by name (native-vision via the
-    // name-sniff fallback: `Config::profile_native_vision` always returns
-    // `None` now, so this is the only signal) so the raw image still reaches
-    // the wire (and thus the log), keeping this test's actual target intact:
-    // the JSONL log redaction for a raw image that DOES flow through (still a
-    // live path -- native-vision passthrough is intentionally unstripped).
-    route_all_to(&mut config, &server.uri());
-    config.upstreams[0].request_log_path = Some(log_path.clone());
-    let app = llmconduit::build_app(config);
+    let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
-        "model": "kimi-text-model",
-        "stream": true,
+        "model": "glm-5.1",
+        "stream": false,
         "input": [{
             "type": "message",
             "role": "user",
             "content": [
-                { "type": "input_text", "text": "what is this?" },
-                { "type": "input_image", "image_url": TEST_IMAGE_DATA_URL }
+                { "type": "input_text", "text": "look" },
+                { "type": "input_image", "file_id": "file-xyz" }
             ]
         }]
     });
@@ -1454,350 +815,35 @@ async fn upstream_request_log_redacts_image_data_when_agent_disabled() {
         )
         .await
         .expect("response");
-    assert_eq!(response.status().as_u16(), 200);
-    let _ = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .expect("body");
-    // Await the spawn_blocking JSONL writer flushing via a bounded poll, so a
-    // real regression fails fast instead of relying on elapsed real time.
-    let contents = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let mut contents = String::new();
-            if std::fs::File::open(&log_path)
-                .and_then(|mut f| f.read_to_string(&mut contents))
-                .is_ok()
-                && !contents.is_empty()
-            {
-                break contents;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("upstream JSONL log should become non-empty");
-    let _ = std::fs::remove_dir_all(&log_dir);
-    assert!(!contents.is_empty(), "log should have an entry");
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    assert_eq!(status, 400, "Reject must fail pre-dispatch with a 4xx");
     assert!(
-        !contents.contains("iVBORw0KGgo"),
-        "upstream JSONL log must not contain raw image base64"
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("text-only"),
+        "structured error body: {parsed}"
     );
-    assert!(
-        contents.contains("<redacted uri>"),
-        "image uri redacted in log"
-    );
+    assert!(upstream.requests().await.is_empty());
 }
 
 #[tokio::test]
-async fn client_tool_named_analyze_image_flows_through_chat_when_agent_inactive() {
-    // Round-7 #2 (inactive): with the image agent OFF, a CLIENT tool literally
-    // named `analyzeImage` must surface to the Chat client normally.
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(tool_call_chunk(
-            "chat-1",
-            "call_user_1",
-            "analyzeImage",
-            "{\"q\":\"client-owned\"}",
-        ))])
-        .await;
-    let mut config = test_config();
-    config.brave_api_key = None;
-    config.image_agent_enabled = false; // agent OFF
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "glm-5.1",
-        "stream": true,
-        "messages": [{ "role": "user", "content": "use my tool" }],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "analyzeImage",
-                "description": "client's own tool",
-                "parameters": { "type": "object", "properties": { "q": { "type": "string" } } }
-            }
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status().as_u16(), 200);
-    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-        .await
-        .expect("body");
-    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(
-        text.contains("analyzeImage"),
-        "an inactive-agent client tool named analyzeImage must reach the Chat client"
-    );
-    assert!(
-        text.contains("client-owned"),
-        "client tool arguments must surface"
-    );
-}
-
-#[tokio::test]
-async fn client_tool_named_analyze_image_flows_through_anthropic_when_agent_inactive() {
-    // Round-7 #2 (inactive): same, through the Anthropic egress — the client
-    // tool must become a tool_use block.
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(tool_call_chunk(
-            "chat-1",
-            "call_user_1",
-            "analyzeImage",
-            "{\"q\":\"client-owned\"}",
-        ))])
-        .await;
-    let mut config = test_config();
-    config.brave_api_key = None;
-    config.image_agent_enabled = false; // agent OFF
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "glm-5.1",
-        "max_tokens": 1024,
-        "stream": true,
-        "messages": [{ "role": "user", "content": "use my tool" }],
-        "tools": [{
-            "name": "analyzeImage",
-            "description": "client's own tool",
-            "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } }
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status().as_u16(), 200);
-    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-        .await
-        .expect("body");
-    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
-    assert!(
-        text.contains("analyzeImage"),
-        "an inactive-agent client tool named analyzeImage must reach the Anthropic client"
-    );
-    assert!(
-        text.contains("tool_use"),
-        "client tool must become a tool_use block"
-    );
-}
-
-// ===========================================================================
-// G4 round-8: native-vision gating decision-table cells.
-// ===========================================================================
-
-#[tokio::test]
-async fn gating_table_all_native_candidates_pass_through() {
-    // Cell (d): every candidate native (by name) ⇒ passthrough.
-    let upstream = MockUpstream::default();
-    upstream.set_candidate_models(["Kimi-K2.6", "kimi-vl-a3b"]);
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "I see a square."))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(
-        serialized.contains("iVBORw0KGgo"),
-        "all-native ⇒ passthrough"
-    );
-}
-
-#[tokio::test]
-async fn gating_table_any_nonnative_fallback_strips() {
-    // Cell (e): one non-native fallback ⇒ STRIP (all-native invariant).
-    let upstream = MockUpstream::default();
-    upstream.set_candidate_models(["Kimi-K2.6", "deepseek-v3"]);
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(
-        !serialized.contains("iVBORw0KGgo"),
-        "any non-native fallback ⇒ strip"
-    );
-}
-
-#[tokio::test]
-async fn gating_table_empty_candidate_set_strips() {
-    // Cell (f): empty candidate set ⇒ STRIP (unknown state, safe default).
-    let upstream = MockUpstream::default();
-    upstream.set_candidate_models(Vec::<String>::new());
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-    // Even a Kimi-looking request model must strip when candidates are unknown.
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.model = "Kimi-K2.6".to_string();
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    let requests = upstream.requests().await;
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(
-        !serialized.contains("iVBORw0KGgo"),
-        "empty candidate set ⇒ strip"
-    );
-}
-
-#[tokio::test]
-async fn upstream_chat_error_body_with_image_url_is_redacted_in_failed() {
-    // Round-9 #2: an upstream 4xx whose error body echoes a data:/signed image
-    // URL must surface a REDACTED response.failed message (and redacted logs) —
-    // the raw image bytes / signed URL must not leak through the error path.
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "object": "list",
-            "data": [{ "id": "text-model", "object": "model" }]
-        })))
-        .mount(&server)
-        .await;
-    // The provider echoes the submitted image back in its 400 body.
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(400).set_body_string(
-            "invalid request near data:image/png;base64,ERRBODYLEAK and https://signed.x/i?sig=ERRSIGLEAK",
-        ))
-        .mount(&server)
-        .await;
-
-    let mut config = test_config();
-    config.brave_api_key = None;
-    // Agent OFF. E2b now degrades this request's own image to a text
-    // placeholder before dispatch (non-native backend), but that is orthogonal
-    // to what this test targets: the LEAKED text below comes from the MOCK's
-    // 400 error BODY, not from the request, so the placeholder swap does not
-    // affect these assertions.
-    config.image_agent_enabled = false;
-    route_all_to(&mut config, &server.uri());
-    let (_app, gateway) = llmconduit::build_app_with_gateway(config);
-
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let mut req = request;
-    req.model = "text-model".to_string();
-    let events = collect_stream(gateway.stream_responses(req).await.expect("stream")).await;
-
-    let failed = events
-        .iter()
-        .find(|e| e["_event"] == "response.failed")
-        .expect("expected a response.failed event");
-    let message = failed["response"]["error"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains("upstream chat failed with 400"),
-        "surfaces the upstream error"
-    );
-    assert!(
-        !message.contains("ERRBODYLEAK"),
-        "data: payload redacted from response.failed"
-    );
-    assert!(
-        !message.contains("ERRSIGLEAK"),
-        "signed-url token redacted from response.failed"
-    );
-    assert!(
-        message.contains("<redacted uri>"),
-        "image uris redacted in error body"
-    );
-}
-
-// ===========================================================================
-// E2b — residual-image safety pass: no raw image reaches a non-native-vision
-// backend, regardless of whether the G4 agent above activated.
-// ===========================================================================
-
-fn file_id_image(file_id: &str) -> ContentItem {
-    ContentItem::InputImage {
-        image_url: None,
-        file_id: Some(file_id.to_string()),
-        detail: None,
-    }
-}
-
-fn message_with_role_and_image(role: &str, image: ContentItem) -> ResponseItem {
-    ResponseItem::Message {
-        id: None,
-        role: role.to_string(),
-        content: vec![image],
-        phase: None,
-    }
-}
-
-// --- AC-4: policy=Placeholder, non-native backend, agent inactive ---
-
-#[tokio::test]
-async fn e2b_placeholder_degrades_user_image_url() {
-    // (a) image_url user image.
+async fn placeholder_policy_degrades_file_id_image() {
+    // The default `placeholder` policy degrades a residual `file_id` image (the
+    // active strip's blind spot) to a stable text placeholder, so no raw file
+    // reference reaches the text-only backend.
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
-
-    let request = base_request(vec![user_message_with_image(
-        "what is this?",
-        TEST_IMAGE_DATA_URL,
-    )]);
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    assert!(event_names(&events).contains(&"response.completed"));
-
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 1);
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(!serialized.contains("iVBORw0KGgo"), "no raw image bytes");
-    assert!(!serialized.contains("image_url"), "no image part at all");
-    assert!(serialized.contains("this model is text-only and cannot view images"));
-    assert!(serialized.contains("1 image(s) were attached here"));
-}
-
-#[tokio::test]
-async fn e2b_placeholder_degrades_user_file_id_image() {
-    // (b) file_id user image -- the ACTIVE strip's own blind spot
-    // (`vision/strip.rs` only matches `image_url: Some`).
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
-        .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
 
     let request = base_request(vec![message_with_role_and_image(
         "user",
@@ -1815,83 +861,16 @@ async fn e2b_placeholder_degrades_user_file_id_image() {
 }
 
 #[tokio::test]
-async fn e2b_placeholder_degrades_tool_output_image_from_anthropic_tool_result() {
-    // (c) tool-output image: an Anthropic tool_result image lowers to a
-    // `FunctionCallOutput` + a following synthetic user-role image message
-    // (`adapters/anthropic_to_responses.rs:339`) -- exercised end-to-end
-    // through the REAL Anthropic HTTP ingress, mirroring
-    // `anthropic_messages_converts_tool_result_history` in `tests/gateway.rs`
-    // but WITHOUT a native-vision override, so the image must degrade.
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "It's 72F in Seattle."))])
-        .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 1024,
-        "stream": true,
-        "messages": [
-            { "role": "user", "content": "What's the weather in Seattle?" },
-            { "role": "assistant", "content": [
-                { "type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": { "location": "Seattle" } }
-            ]},
-            { "role": "user", "content": [
-                { "type": "tool_result", "tool_use_id": "toolu_1", "content": [
-                    { "type": "text", "text": "72F sunny" },
-                    { "type": "image", "source": { "type": "url", "url": "https://example.com/radar.png" } }
-                ]}
-            ]}
-        ],
-        "tools": [{
-            "name": "get_weather",
-            "description": "Get the weather",
-            "input_schema": {
-                "type": "object",
-                "properties": { "location": { "type": "string" } },
-                "required": ["location"]
-            }
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status().as_u16(), 200);
-    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
-
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 1);
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(
-        !serialized.contains("radar.png"),
-        "no raw image URL upstream"
-    );
-    assert!(
-        serialized.contains("the tool returned an image"),
-        "tool-output wording expected: {serialized}"
-    );
-    // The DEFAULT wording must NOT be used for a tool-output continuation.
-    assert!(!serialized.contains("ask the user to describe"));
-}
-
-#[tokio::test]
-async fn e2b_placeholder_degrades_image_in_non_user_message() {
-    // (d) an image in a NON-user message -- role-agnostic sweep.
+async fn placeholder_policy_degrades_image_in_non_user_message() {
+    // Role-agnostic: a residual image in a NON-user message is swept too.
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
 
     let request = base_request(vec![
         message_with_role_and_image(
@@ -1904,162 +883,93 @@ async fn e2b_placeholder_degrades_image_in_non_user_message() {
         ),
         user_message("what did you just show me?"),
     ]);
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-    assert!(event_names(&events).contains(&"response.completed"));
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
     let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 1);
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(!serialized.contains("ASSISTANTRAW"));
     assert!(serialized.contains("this model is text-only and cannot view images"));
 }
 
-// --- AC-5: determinism + replay bypass ---
-
 #[tokio::test]
-async fn e2b_lowering_same_request_twice_is_byte_identical() {
+async fn active_agent_degrades_old_residual_but_strips_latest_image() {
+    // The two seams cooperate: the LATEST user image_url is stripped+cached
+    // (analyzeImage-referenceable), while an OLDER `file_id` residual the strip
+    // cannot see is degraded to a placeholder by the sweep.
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
         .await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-2", "ok"))])
-        .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
-
-    let request = base_request(vec![user_message_with_image(
-        "describe this",
-        TEST_IMAGE_DATA_URL,
-    )]);
-    let _ = collect_stream(
-        gateway
-            .clone()
-            .stream_responses(request.clone())
-            .await
-            .expect("stream"),
-    )
-    .await;
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-
-    let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 2);
-    assert_eq!(
-        serde_json::to_value(&requests[0]).unwrap(),
-        serde_json::to_value(&requests[1]).unwrap(),
-        "the SAME inbound request lowered twice must produce byte-identical upstream JSON"
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
     );
-    let serialized = serde_json::to_string(&requests[0]).unwrap();
-    assert!(!serialized.contains("iVBORw0KGgo"));
-}
 
-#[tokio::test]
-async fn e2b_multi_image_order_preserved_after_degrade() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
-        .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
-
-    let message = ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![
-            ContentItem::InputText {
-                text: "A".to_string(),
-            },
-            ContentItem::InputImage {
-                image_url: Some("data:image/png;base64,IMAGEONE".to_string()),
-                file_id: None,
-                detail: None,
-            },
-            ContentItem::InputText {
-                text: "B".to_string(),
-            },
-            ContentItem::InputImage {
-                image_url: Some("data:image/png;base64,IMAGETWO".to_string()),
-                file_id: None,
-                detail: None,
-            },
-            ContentItem::InputText {
-                text: "C".to_string(),
-            },
-        ],
-        phase: None,
-    };
-    let request = base_request(vec![message]);
+    let request = base_request(vec![
+        message_with_role_and_image("user", file_id_image("file-old-residual")),
+        ResponseItem::message_text("assistant", "ok, what next?"),
+        user_message_with_image("look at this one", TEST_IMAGE_DATA_URL),
+    ]);
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
     let requests = upstream.requests().await;
-    let content = serde_json::to_string(&requests[0].messages[0].content).expect("serialize");
-    assert!(!content.contains("IMAGEONE") && !content.contains("IMAGETWO"));
-    // Sequential search from the previous match proves the ORIGINAL relative
-    // order (text, placeholder, text, placeholder, text) survived, without
-    // assuming a specific flattened-vs-array JSON shape.
-    let pos_a = content.find('A').expect("A present");
-    let pos_ph1 = content[pos_a..]
-        .find("text-only")
-        .map(|p| p + pos_a)
-        .expect("first placeholder present");
-    let pos_b = content[pos_ph1..]
-        .find('B')
-        .map(|p| p + pos_ph1)
-        .expect("B present");
-    let pos_ph2 = content[pos_b..]
-        .find("text-only")
-        .map(|p| p + pos_b)
-        .expect("second placeholder present");
-    let pos_c = content[pos_ph2..]
-        .find('C')
-        .map(|p| p + pos_ph2)
-        .expect("C present");
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(!serialized.contains("iVBORw0KGgo"), "latest image stripped");
     assert!(
-        pos_a < pos_ph1 && pos_ph1 < pos_b && pos_b < pos_ph2 && pos_ph2 < pos_c,
-        "order not preserved: {content}"
+        !serialized.contains("file-old-residual"),
+        "old file_id degraded"
     );
-    assert!(content.contains("2 image(s) were attached here"));
+    assert!(
+        serialized.contains("[Image #1]"),
+        "latest image placeholder"
+    );
+    assert!(serialized.contains("this model is text-only and cannot view images"));
 }
 
 #[tokio::test]
-async fn e2b_degraded_turn_does_not_write_to_replay_cache() {
+async fn degraded_turn_does_not_write_to_replay_cache() {
+    // A degraded turn (a residual `file_id` image collapses to a positionally
+    // deterministic placeholder that two DISTINCT images would share) must bypass
+    // the replay cache, even when the caller opts in with store=true.
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "42F"))])
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
     let replay_store = ReplayStore::new(1000);
     let gateway = test_gateway_with_config_and_replay_store(
         upstream.clone(),
         MockSearch::default(),
-        test_config(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
         replay_store.clone(),
     );
 
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    request.store = true; // caller opts in; the degrade must override this.
+    let mut request = base_request(vec![message_with_role_and_image(
+        "user",
+        file_id_image("file-abc123"),
+    )]);
+    request.store = true;
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     assert!(event_names(&events).contains(&"response.completed"));
-
     assert!(
         replay_store.is_empty().await,
-        "a degraded turn must never be written to the replay cache, \
-         even when the caller requested store=true"
+        "a degraded turn must never be written to the replay cache"
     );
 }
 
 #[tokio::test]
-async fn e2b_degraded_turn_does_not_read_from_replay_cache() {
-    // Prove two DISTINCT images at the same position do not collide: seed a
-    // baseline whose key is EXACTLY what this turn's degraded history would
-    // hash to (computed via the SAME public `degrade_residual_images` fn the
-    // engine calls, so this does not hardcode placeholder wording separately
-    // from the implementation), carrying a distinctive marker that must NOT
-    // leak into the dispatched request if the lookup is correctly bypassed.
+async fn degraded_turn_does_not_read_from_replay_cache() {
+    // A degraded turn must bypass the replay LOOKUP too, so a pre-existing
+    // baseline whose key exactly matches the degraded history is never served.
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
     let replay_store = ReplayStore::new(1000);
 
-    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    let mut request = base_request(vec![message_with_role_and_image(
+        "user",
+        file_id_image("file-abc123"),
+    )]);
     request.store = true;
     let mut would_be_degraded = request.input.clone();
     llmconduit::vision::degrade_residual_images(&mut would_be_degraded);
@@ -2084,7 +994,7 @@ async fn e2b_degraded_turn_does_not_read_from_replay_cache() {
     let gateway = test_gateway_with_config_and_replay_store(
         upstream.clone(),
         MockSearch::default(),
-        test_config(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
         replay_store.clone(),
     );
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -2094,385 +1004,6 @@ async fn e2b_degraded_turn_does_not_read_from_replay_cache() {
     let serialized = serde_json::to_string(&requests[0]).expect("serialize");
     assert!(
         !serialized.contains("POISONED_BASELINE_MARKER_ZZZ"),
-        "a degraded turn must not read a pre-existing replay baseline, \
-         even an exactly-hash-matching one"
-    );
-}
-
-// --- AC-7: no regression to the active-agent path / native-vision passthrough ---
-
-#[tokio::test]
-async fn e2b_active_agent_degrades_residual_image_without_double_transform() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-
-    // History: an OLDER turn's file_id image (the ACTIVE strip's blind spot)
-    // plus the LATEST user turn's normal image_url image (what the active
-    // agent DOES strip+cache+offer analyzeImage for).
-    let request = base_request(vec![
-        message_with_role_and_image("user", file_id_image("file-old-residual")),
-        ResponseItem::message_text("assistant", "ok, what next?"),
-        user_message_with_image("look at this one", TEST_IMAGE_DATA_URL),
-    ]);
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-
-    let requests = upstream.requests().await;
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    // The residual file_id image is degraded by E2b (no raw file_id leaked).
-    assert!(!serialized.contains("file-old-residual"));
-    assert!(serialized.contains("text-only and cannot view images"));
-    // The ACTIVE agent's own placeholder for the LATEST image survives
-    // untouched -- not double-transformed into the E2b wording.
-    assert!(serialized.contains("[Image #1]"));
-    assert!(serialized.contains("analyzeImage"));
-    assert!(
-        !serialized.contains("iVBORw0KGgo"),
-        "no raw bytes leaked either way"
-    );
-}
-
-#[tokio::test]
-async fn e2b_native_vision_passthrough_skips_residual_pass_entirely() {
-    let upstream = MockUpstream::default();
-    upstream.set_supported_models(["Kimi-K2.6"]).await;
-    upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "I see it"))])
-        .await;
-    let gateway = test_gateway_with_vision(
-        upstream.clone(),
-        MockVisionClient::default(),
-        image_agent_config(),
-    );
-
-    // A residual image in a NON-user message -- exactly what E2b would catch
-    // on a non-native backend. On native-vision passthrough the WHOLE
-    // residual pass must be skipped, so this must ALSO survive untouched.
-    let mut request = base_request(vec![
-        message_with_role_and_image(
-            "assistant",
-            ContentItem::InputImage {
-                image_url: Some("data:image/png;base64,ASSISTANTBYTES".to_string()),
-                file_id: None,
-                detail: None,
-            },
-        ),
-        user_message_with_image("look", TEST_IMAGE_DATA_URL),
-    ]);
-    request.model = "Kimi-K2.6".to_string();
-    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-
-    let requests = upstream.requests().await;
-    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
-    assert!(
-        serialized.contains("ASSISTANTBYTES"),
-        "native-vision must forward the non-user residual image untouched"
-    );
-    assert!(
-        serialized.contains("iVBORw0KGgo"),
-        "native-vision must forward the latest user image untouched"
-    );
-    assert!(
-        !serialized.contains("text-only and cannot view images"),
-        "residual pass must not fire on native-vision passthrough"
-    );
-}
-
-// --- AC-8: policy=Reject fails pre-dispatch with a 4xx, never 502 ---
-
-#[tokio::test]
-async fn e2b_reject_policy_anthropic_returns_4xx_not_502_and_skips_provider() {
-    let upstream = MockUpstream::default();
-    let mut config = test_config();
-    config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "text-model",
-        "max_tokens": 1024,
-        "stream": false,
-        "messages": [{
-            "role": "user",
-            "content": [
-                { "type": "text", "text": "look" },
-                { "type": "image", "source": { "type": "url", "url": "https://example.com/x.png" } }
-            ]
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .expect("body");
-    let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
-
-    assert_eq!(
-        status, 400,
-        "Reject must fail pre-dispatch with a 4xx, never 502"
-    );
-    assert_eq!(parsed["type"], "error");
-    assert_eq!(parsed["error"]["type"], "invalid_request_error");
-    assert!(
-        parsed["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("text-only"),
-        "structured Anthropic error body: {parsed}"
-    );
-    assert!(
-        upstream.requests().await.is_empty(),
-        "provider must never be contacted on Reject"
-    );
-}
-
-#[tokio::test]
-async fn e2b_reject_policy_chat_returns_4xx_not_502_and_skips_provider() {
-    let upstream = MockUpstream::default();
-    let mut config = test_config();
-    config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "glm-5.1",
-        "stream": false,
-        "messages": [{
-            "role": "user",
-            "content": [
-                { "type": "text", "text": "look" },
-                { "type": "image_url", "image_url": { "url": "https://example.com/x.png" } }
-            ]
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .expect("body");
-    let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
-
-    assert_eq!(
-        status, 400,
-        "Reject must fail pre-dispatch with a 4xx, never 502"
-    );
-    assert!(
-        parsed["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("text-only"),
-        "structured error body: {parsed}"
-    );
-    assert!(
-        upstream.requests().await.is_empty(),
-        "provider must never be contacted on Reject"
-    );
-}
-
-#[tokio::test]
-async fn e2b_reject_policy_responses_returns_4xx_not_502_and_skips_provider() {
-    let upstream = MockUpstream::default();
-    let mut config = test_config();
-    config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
-    let app = llmconduit::build_app_from_gateway(gateway);
-
-    let body = json!({
-        "model": "glm-5.1",
-        "stream": false,
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [
-                { "type": "input_text", "text": "look" },
-                { "type": "input_image", "image_url": "https://example.com/x.png" }
-            ]
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    let status = response.status().as_u16();
-    let bytes = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .expect("body");
-    let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
-
-    assert_eq!(
-        status, 400,
-        "Reject must fail pre-dispatch with a 4xx, never 502"
-    );
-    assert!(
-        parsed["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("text-only"),
-        "structured error body: {parsed}"
-    );
-    assert!(
-        upstream.requests().await.is_empty(),
-        "provider must never be contacted on Reject"
-    );
-}
-
-// --- AC-9: no image bytes anywhere for a degraded turn ---
-
-#[tokio::test]
-async fn e2b_ac9_no_image_bytes_in_upstream_jsonl_log_for_degraded_turn() {
-    use std::io::Read;
-    let log_dir = std::env::temp_dir().join(format!(
-        "llmconduit-e2b-log-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&log_dir).expect("mkdir");
-    let log_path = log_dir.join("upstream.jsonl");
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "object": "list",
-            "data": [{ "id": "text-model", "object": "model" }]
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(chat_completion_sse_body(&[json!({
-                    "id": "chat-1",
-                    "choices": [{ "index": 0, "delta": { "content": "ok" }, "finish_reason": "stop" }]
-                })])),
-        )
-        .mount(&server)
-        .await;
-
-    // Default config: agent inactive, non-native backend -- the field
-    // incident's exact shape. Placeholder policy is the default.
-    let mut config = test_config();
-    config.brave_api_key = None;
-    route_all_to(&mut config, &server.uri());
-    config.upstreams[0].request_log_path = Some(log_path.clone());
-    let app = llmconduit::build_app(config);
-
-    let body = json!({
-        "model": "text-model",
-        "stream": true,
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [
-                { "type": "input_text", "text": "what is this?" },
-                { "type": "input_image", "image_url": TEST_IMAGE_DATA_URL }
-            ]
-        }]
-    });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status().as_u16(), 200);
-    let _ = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-        .await
-        .expect("body");
-
-    let contents = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let mut contents = String::new();
-            if std::fs::File::open(&log_path)
-                .and_then(|mut f| f.read_to_string(&mut contents))
-                .is_ok()
-                && !contents.is_empty()
-            {
-                break contents;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("upstream JSONL log should become non-empty");
-    let _ = std::fs::remove_dir_all(&log_dir);
-
-    assert!(!contents.is_empty(), "log should have an entry");
-    assert!(
-        !contents.contains("iVBORw0KGgo"),
-        "no raw image base64 in the degraded turn's upstream log"
-    );
-    assert!(
-        contents.contains("text-only and cannot view images"),
-        "the placeholder text (not the image) reached the wire: {contents}"
-    );
-}
-
-#[tokio::test]
-async fn e2b_ac9_no_image_bytes_in_failed_error_text_for_degraded_turn() {
-    let upstream = MockUpstream::default();
-    upstream
-        .push_response(vec![Err(llmconduit::error::AppError::upstream(
-            "upstream exploded before first token",
-        ))])
-        .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
-
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
-    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
-
-    let failed = events
-        .iter()
-        .find(|e| e["_event"] == "response.failed")
-        .expect("expected a response.failed event");
-    let message = failed["response"]["error"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        !message.contains("iVBORw0KGgo"),
-        "no raw image bytes in the failed-turn error text"
-    );
-    assert!(
-        !message.contains("data:image"),
-        "no image data URI scheme in the failed-turn error text"
+        "a degraded turn must not read a pre-existing replay baseline"
     );
 }
