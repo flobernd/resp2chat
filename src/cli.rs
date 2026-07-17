@@ -1,4 +1,7 @@
+use crate::config::OrderedModelProfiles;
 use crate::config::PersistedConfig;
+use crate::config::PersistedModelProfile;
+use crate::config::PersistedUpstream;
 use crate::config::default_config_path;
 use crate::config::load_persisted_config;
 use crate::config::write_persisted_config;
@@ -36,11 +39,6 @@ pub enum Commands {
         /// Dump raw model delta text to the terminal while the gateway is running.
         #[arg(long, default_value_t = false)]
         raw: bool,
-        /// Ad-hoc model route `NAME=URL[,UPSTREAM_MODEL]`, repeatable. NAME may be
-        /// a glob (e.g. `claude-opus-*`). Merged after the config file and env
-        /// (CLI wins); a malformed spec is a clean startup error.
-        #[arg(long = "model-route", value_name = "NAME=URL[,UPSTREAM_MODEL]")]
-        model_route: Vec<String>,
     },
     /// Run the interactive configuration flow and write a config file.
     Configure {
@@ -78,12 +76,38 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         .default(existing.bind_addr.clone())
         .interact_text()
         .map_err(|err| format!("failed to read bind address: {err}"))?;
+
+    // The single default endpoint is persisted as one `upstreams` entry named
+    // "default" plus a `"*"` catch-all profile pointing at it, so the interactive
+    // prompts pre-fill from (and write back) that shape.
+    let existing_default = existing
+        .upstreams
+        .iter()
+        .find(|entry| entry.name == "default")
+        .or_else(|| existing.upstreams.first());
+    let existing_url = existing_default
+        .map(|entry| entry.url.clone())
+        .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string());
+    let existing_api_key = existing_default.and_then(|entry| entry.api_key.clone());
+    let existing_entry_chat_kwargs = existing_default
+        .map(|entry| entry.chat_kwargs.clone())
+        .unwrap_or_default();
+    let existing_request_log_path = existing_default
+        .and_then(|entry| entry.request_log_path.clone())
+        .or_else(|| existing.upstream_request_log_path.clone());
+    let existing_default_model = existing
+        .model_profiles
+        .0
+        .iter()
+        .find(|(name, _)| name == "*")
+        .and_then(|(_, profile)| profile.upstream_model.clone());
+
     let upstream_base_url = Input::with_theme(&theme)
         .with_prompt("Upstream chat-completions base URL")
-        .default(existing.upstream_base_url.clone())
+        .default(existing_url)
         .interact_text()
         .map_err(|err| format!("failed to read upstream URL: {err}"))?;
-    let upstream_api_key = match existing.upstream_api_key.clone() {
+    let upstream_api_key = match existing_api_key {
         Some(existing_api_key) => {
             let keep_existing = Confirm::with_theme(&theme)
                 .with_prompt("Keep existing upstream API key?")
@@ -113,27 +137,22 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
     let upstream_model = Input::with_theme(&theme)
         .with_prompt("Upstream model override (leave blank to pass through request model)")
         .allow_empty(true)
-        .default(existing.upstream_model.clone().unwrap_or_default())
+        .default(existing_default_model.unwrap_or_default())
         .interact_text()
         .map_err(|err| format!("failed to read upstream model override: {err}"))?;
     let upstream_request_log_path = Input::with_theme(&theme)
         .with_prompt("Upstream request JSONL log path (leave blank to disable)")
         .allow_empty(true)
-        .default(
-            existing
-                .upstream_request_log_path
-                .clone()
-                .unwrap_or_default(),
-        )
+        .default(existing_request_log_path.unwrap_or_default())
         .interact_text()
         .map_err(|err| format!("failed to read upstream request log path: {err}"))?;
     let upstream_chat_kwargs = Input::with_theme(&theme)
         .with_prompt("Extra upstream chat kwargs as JSON object (leave blank for none)")
         .allow_empty(true)
-        .default(if existing.upstream_chat_kwargs.is_empty() {
+        .default(if existing_entry_chat_kwargs.is_empty() {
             String::new()
         } else {
-            serde_json::to_string(&existing.upstream_chat_kwargs)
+            serde_json::to_string(&existing_entry_chat_kwargs)
                 .map_err(|err| format!("failed to encode upstream chat kwargs: {err}"))?
         })
         .interact_text()
@@ -166,24 +185,40 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
             .map_err(|err| format!("invalid upstream chat kwargs JSON: {err}"))?
     };
 
+    let default_upstream = PersistedUpstream {
+        name: "default".to_string(),
+        url: upstream_base_url,
+        api_key: upstream_api_key,
+        chat_kwargs: upstream_chat_kwargs,
+        request_log_path: (!upstream_request_log_path.trim().is_empty())
+            .then(|| upstream_request_log_path.trim().to_string()),
+        upstream_model: None,
+        fallback_upstreams: None,
+    };
+    let default_profile = PersistedModelProfile {
+        upstream: Some("default".to_string()),
+        upstream_model: (!upstream_model.trim().is_empty())
+            .then(|| upstream_model.trim().to_string()),
+        ..PersistedModelProfile::default()
+    };
+
     let config = PersistedConfig {
         bind_addr,
-        upstream_base_url,
-        upstream_api_key,
-        upstream_model: (!upstream_model.trim().is_empty()).then_some(upstream_model),
+        upstream_base_url: None,
+        upstream_api_key: None,
+        upstream_model: None,
         system_prompt_prefix: existing.system_prompt_prefix.clone(),
-        upstream_request_log_path: (!upstream_request_log_path.trim().is_empty())
-            .then_some(upstream_request_log_path),
+        upstream_request_log_path: None,
         // F1: not interactively prompted (an advanced, opt-in knob, like
         // `debug_log_max_age_hours` below) -- just carried through unchanged.
         turn_capture_dir: existing.turn_capture_dir.clone(),
-        upstream_chat_kwargs,
-        upstreams: existing.upstreams.clone(),
-        fallback_upstreams: existing.fallback_upstreams.clone(),
+        upstream_chat_kwargs: existing.upstream_chat_kwargs.clone(),
+        upstreams: vec![default_upstream],
+        fallback_upstreams: None,
         upstream_failure_cooldown_secs: existing.upstream_failure_cooldown_secs,
         model_profile_templates: existing.model_profile_templates.clone(),
-        model_profiles: existing.model_profiles.clone(),
-        model_routes: existing.model_routes.clone(),
+        model_profiles: OrderedModelProfiles(vec![("*".to_string(), default_profile)]),
+        model_routes: None,
         template_family: existing.template_family.clone(),
         brave_base_url,
         brave_api_key: (!brave_api_key.trim().is_empty()).then_some(brave_api_key),
@@ -197,12 +232,12 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         min_completion_tokens: existing.min_completion_tokens,
         max_sse_frame_bytes: existing.max_sse_frame_bytes,
         max_request_body_bytes: existing.max_request_body_bytes,
-        image_agent_enabled: existing.image_agent_enabled,
-        vision_url: existing.vision_url.clone(),
-        vision_model: existing.vision_model.clone(),
+        image_agent_enabled: None,
+        vision_url: None,
+        vision_model: None,
         image_cache_max_size: existing.image_cache_max_size,
         image_cache_ttl_secs: existing.image_cache_ttl_secs,
-        unsupported_image_policy: existing.unsupported_image_policy,
+        unsupported_image_policy: None,
         price_table: existing.price_table.clone(),
     };
 

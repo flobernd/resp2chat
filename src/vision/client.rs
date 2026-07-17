@@ -257,12 +257,18 @@ mod tests {
 
     #[test]
     fn reqwest_vision_client_builds_body_with_image_parts() {
-        let config = crate::config::Config::from_persisted(&crate::config::PersistedConfig {
-            vision_url: Some("http://127.0.0.1:9000/v1/chat/completions".to_string()),
-            vision_model: Some("vision-model".to_string()),
-            ..crate::config::PersistedConfig::default()
-        })
-        .expect("config");
+        // The vision endpoint lives on the runtime `Config` (the persisted knobs
+        // were removed in Task 4; Task 9 rebuilds image handling around profile
+        // `image_analysis`), so set it directly for this leaf-level body test.
+        let mut config =
+            crate::config::Config::from_persisted(&crate::config::PersistedConfig::default())
+                .expect("config");
+        config.vision_url = Some(
+            "http://127.0.0.1:9000/v1/chat/completions"
+                .parse()
+                .expect("url"),
+        );
+        config.vision_model = Some("vision-model".to_string());
         let client = ReqwestVisionClient::new(reqwest::Client::new(), &config);
         let request = VisionRequest {
             image_ids: vec!["1".to_string()],
