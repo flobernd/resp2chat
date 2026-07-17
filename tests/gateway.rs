@@ -1181,7 +1181,6 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                             "preserve_thinking": true
                         }),
                     )]),
-                    native_vision: None,
                     ..Default::default()
                 },
             )]),
@@ -1239,7 +1238,6 @@ async fn prepends_profile_system_prompt_prefix_for_responses_requests() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
-            native_vision: None,
             ..Default::default()
         },
     )]);
@@ -7746,7 +7744,6 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                     "shared": "model"
                 }),
             )]),
-            native_vision: None,
             ..Default::default()
         },
     )]);
@@ -7911,21 +7908,16 @@ async fn chat_completions_preserves_multimodal_content_parts() {
     // round-tripping unchanged (image_url/input_audio/file), which is only
     // true when the backend is native-vision -- a non-native backend now
     // degrades the image part to a text placeholder (the whole point of E2b;
-    // covered by its own dedicated tests). Force `native_vision: true` here so
-    // this test keeps proving adapter fidelity, not image-degradation policy.
-    let mut config = test_config();
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "glm-5.1".to_string(),
-        llmconduit::config::ModelProfile {
-            native_vision: Some(true),
-            ..Default::default()
-        },
-    )]);
+    // covered by its own dedicated tests). The model is Kimi-recognized by
+    // name (native-vision via the name-sniff fallback -- `native_vision` is no
+    // longer a profile knob) so this test keeps proving adapter fidelity, not
+    // image-degradation policy.
+    let config = test_config();
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
-        "model": "glm-5.1",
+        "model": "Kimi-K2.6",
         "stream": false,
         "messages": [
             {
@@ -8299,7 +8291,6 @@ async fn chat_completions_prepends_profile_system_prompt_prefix() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
-            native_vision: None,
             ..Default::default()
         },
     )]);
@@ -8554,22 +8545,15 @@ async fn anthropic_messages_preserves_image_content_parts() {
     // all survive canonical round-tripping to `image_url`/`file_id` chat
     // parts, which is only true on a native-vision backend -- a non-native
     // backend now degrades every one of these to a text placeholder (the
-    // whole point of E2b; covered by its own dedicated tests). Force
-    // `native_vision: true` so this test keeps proving adapter fidelity, not
-    // image-degradation policy.
-    let mut config = test_config();
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "claude-3-5-sonnet-20241022".to_string(),
-        llmconduit::config::ModelProfile {
-            native_vision: Some(true),
-            ..Default::default()
-        },
-    )]);
+    // whole point of E2b; covered by its own dedicated tests). The model is
+    // Kimi-recognized by name (native-vision via the name-sniff fallback) so
+    // this test keeps proving adapter fidelity, not image-degradation policy.
+    let config = test_config();
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
-        "model": "claude-3-5-sonnet-20241022",
+        "model": "Kimi-K2.6",
         "max_tokens": 1024,
         "stream": false,
         "messages": [
@@ -8999,7 +8983,6 @@ async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
-            native_vision: None,
             ..Default::default()
         },
     )]);
@@ -9314,21 +9297,15 @@ async fn responses_preserves_multimodal_input_parts() {
     // parts survive lowering to the upstream chat payload unchanged, which is
     // only true on a native-vision backend -- a non-native backend now
     // degrades the image part to a text placeholder (the whole point of E2b;
-    // covered by its own dedicated tests). Force `native_vision: true` so this
-    // test keeps proving lowering fidelity, not image-degradation policy.
-    let mut config = test_config();
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "glm-5.1".to_string(),
-        llmconduit::config::ModelProfile {
-            native_vision: Some(true),
-            ..Default::default()
-        },
-    )]);
+    // covered by its own dedicated tests). The model is Kimi-recognized by
+    // name (native-vision via the name-sniff fallback) so this test keeps
+    // proving lowering fidelity, not image-degradation policy.
+    let config = test_config();
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
-        "model": "glm-5.1",
+        "model": "Kimi-K2.6",
         "stream": false,
         "input": [
             {
@@ -9414,22 +9391,16 @@ async fn anthropic_messages_converts_tool_result_history() {
     // converts to a `FunctionCallOutput` + separate image message, which is
     // only forwarded byte-for-byte on a native-vision backend -- a non-native
     // backend now degrades it to a text placeholder (the exact "tool-output
-    // image" shape E2b targets; covered by its own dedicated tests). Force
-    // `native_vision: true` so this test keeps proving the tool_result/image
-    // conversion shape, not image-degradation policy.
-    let mut config = test_config();
-    config.model_profiles = std::collections::BTreeMap::from([(
-        "claude-3-5-sonnet-20241022".to_string(),
-        llmconduit::config::ModelProfile {
-            native_vision: Some(true),
-            ..Default::default()
-        },
-    )]);
+    // image" shape E2b targets; covered by its own dedicated tests). The model
+    // is Kimi-recognized by name (native-vision via the name-sniff fallback)
+    // so this test keeps proving the tool_result/image conversion shape, not
+    // image-degradation policy.
+    let config = test_config();
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
-        "model": "claude-3-5-sonnet-20241022",
+        "model": "Kimi-K2.6",
         "max_tokens": 1024,
         "stream": true,
         "messages": [

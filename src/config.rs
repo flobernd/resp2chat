@@ -981,10 +981,70 @@ impl<'de> Deserialize<'de> for OrderedModelRoutes {
     }
 }
 
+/// A single fallback hop for a model profile: the named `upstreams:` entry to
+/// try, plus an optional model-name remap for that hop. Accepts a bare string
+/// (`"openrouter"`, upstream name only) or the table form, mirroring
+/// `RawPersistedModelRoute`'s untagged str-or-table pattern (config.rs:851-865).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "RawPersistedProfileFallback")]
+pub struct PersistedProfileFallback {
+    pub upstream: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawPersistedProfileFallback {
+    Upstream(String),
+    Table {
+        upstream: String,
+        #[serde(default)]
+        model: Option<String>,
+    },
+}
+
+impl From<RawPersistedProfileFallback> for PersistedProfileFallback {
+    fn from(raw: RawPersistedProfileFallback) -> Self {
+        match raw {
+            RawPersistedProfileFallback::Upstream(upstream) => Self {
+                upstream,
+                model: None,
+            },
+            RawPersistedProfileFallback::Table { upstream, model } => Self { upstream, model },
+        }
+    }
+}
+
+/// Policy for an `image_analysis` redirect's residual image (one the redirect
+/// itself did not consume; see `UnsupportedImagePolicy`, which this mirrors).
+/// `Placeholder` (the default) replaces it with an instructive text
+/// placeholder; `Reject` fails the turn before dispatch with a 4xx instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidualImagePolicy {
+    #[default]
+    Placeholder,
+    Reject,
+}
+
+/// Per-profile redirect: images route to `model` (another profile) instead of
+/// the native/agent path. See README "Migrating" for the `native_vision`
+/// replacement this enables.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImageAnalysisConfig {
+    pub model: String,
+    #[serde(default)]
+    pub residual_images: ResidualImagePolicy,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Default)]
 pub struct PersistedModelProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -993,13 +1053,19 @@ pub struct PersistedModelProfile {
     pub roles: Option<RolesConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_family: Option<String>,
-    /// Per-profile override for whether the resolved backend can natively see
-    /// images (G4). `Some(true)` forces the image agent OFF for this profile
-    /// (the backend is multimodal); `Some(false)` forces text-only handling
-    /// even for a name the family sniff would treat as native-vision. `None`
-    /// defers to the name-based default.
+    // Removed-key detection only; presence is a startup error (see README
+    // "Migrating"). Native image passthrough is now the default and
+    // `image_analysis` enables the redirect.
+    #[serde(default, skip_serializing)]
+    pub native_vision: Option<JsonValue>,
+    /// Ordered fallback hops tried after `upstream` (and after the model's own
+    /// exhausted retries). `None` means "not set here"; distinct from `Some(vec![])`
+    /// ("set to explicitly empty") so `extends` merge can tell inherit-from-template
+    /// apart from override-to-no-fallbacks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_vision: Option<bool>,
+    pub fallbacks: Option<Vec<PersistedProfileFallback>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_analysis: Option<ImageAnalysisConfig>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     /// Per-model map from a canonical reasoning-effort level (`none`/`low`/
@@ -1035,6 +1101,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             extends: Vec<String>,
             #[serde(default)]
+            upstream: Option<String>,
+            #[serde(default)]
             upstream_model: Option<String>,
             #[serde(default)]
             system_prompt_prefix: Option<String>,
@@ -1043,7 +1111,11 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             template_family: Option<String>,
             #[serde(default)]
-            native_vision: Option<bool>,
+            native_vision: Option<JsonValue>,
+            #[serde(default)]
+            fallbacks: Option<Vec<PersistedProfileFallback>>,
+            #[serde(default)]
+            image_analysis: Option<ImageAnalysisConfig>,
             #[serde(default)]
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default)]
@@ -1065,6 +1137,9 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
         // `flatten` swept into the shorthand bucket (they live in typed fields).
         upstream_chat_kwargs.remove("template_family");
         upstream_chat_kwargs.remove("native_vision");
+        upstream_chat_kwargs.remove("upstream");
+        upstream_chat_kwargs.remove("fallbacks");
+        upstream_chat_kwargs.remove("image_analysis");
         upstream_chat_kwargs.remove("reasoning_effort_map");
         upstream_chat_kwargs.remove("reasoning_effort_default");
         upstream_chat_kwargs.remove("reasoning_effort");
@@ -1073,11 +1148,14 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
         merge_json_maps(&mut upstream_chat_kwargs, &raw.upstream_chat_kwargs);
         Ok(Self {
             extends: raw.extends,
+            upstream: raw.upstream,
             upstream_model: raw.upstream_model,
             system_prompt_prefix: raw.system_prompt_prefix,
             roles: raw.roles,
             template_family: raw.template_family,
             native_vision: raw.native_vision,
+            fallbacks: raw.fallbacks,
+            image_analysis: raw.image_analysis,
             upstream_chat_kwargs,
             reasoning_effort_map: raw.reasoning_effort_map,
             reasoning_effort_default: raw.reasoning_effort_default,
@@ -1087,20 +1165,38 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
     }
 }
 
+/// A resolved fallback hop: the named `upstreams:` entry to try, plus an
+/// optional model-name remap for that hop.
+#[derive(Debug, Clone)]
+pub struct ProfileFallback {
+    pub upstream: String,
+    pub model: Option<String>,
+}
+
+impl From<PersistedProfileFallback> for ProfileFallback {
+    fn from(persisted: PersistedProfileFallback) -> Self {
+        Self {
+            upstream: persisted.upstream,
+            model: persisted.model,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
+    pub upstream: Option<String>,
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub roles: Option<RolesConfig>,
     pub template_family: Option<String>,
-    /// Per-profile native-vision override (G4); see `PersistedModelProfile`.
-    pub native_vision: Option<bool>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     /// Per-model reasoning-effort map + default; see `PersistedModelProfile`.
     pub reasoning_effort_map: BTreeMap<String, JsonValue>,
     pub reasoning_effort_default: Option<String>,
     pub capabilities: Option<CapabilitiesConfig>,
     pub reasoning_effort: Option<ReasoningConfig>,
+    pub fallbacks: Vec<ProfileFallback>,
+    pub image_analysis: Option<ImageAnalysisConfig>,
 }
 
 /// Resolved reasoning-effort policy for a backend model: canonical effort level
@@ -1774,17 +1870,12 @@ impl Config {
         &self.upstream_chat_kwargs
     }
 
-    /// Direct, PROFILE-ONLY `native_vision` lookup for EXACTLY `model` (G4
-    /// round-9 #1). Looks up the profile keyed on `model` and returns its
-    /// (already template-resolved) `native_vision`, with NO `upstream_model`
-    /// remap. This is the ONLY native_vision accessor G4 gating uses: each input
-    /// is already a final backend model (a candidate) or the literal request
-    /// model, so re-applying the `upstream_model` remap would judge a DIFFERENT
-    /// model's profile than the one the provider receives / than the request
-    /// actually carries.
+    /// Always `None`: per-profile native-vision detection is being replaced by
+    /// `image_analysis` (see README "Migrating"). G4 callers still call this
+    /// and fall through to their name-based heuristics.
     pub fn profile_native_vision(&self, model: &str) -> Option<bool> {
-        self.model_profile(model)
-            .and_then(|profile| profile.native_vision)
+        let _ = model;
+        None
     }
 
     pub fn resolve_system_prompt_prefix(&self, request_model: &str) -> Option<String> {
@@ -1864,7 +1955,9 @@ impl Config {
         profiles
     }
 
-    fn model_profile(&self, request_model: &str) -> Option<&ModelProfile> {
+    /// Looks up the profile keyed on `request_model` (exact, then
+    /// case-insensitive), already `extends`-resolved.
+    pub fn model_profile(&self, request_model: &str) -> Option<&ModelProfile> {
         self.model_profiles.get(request_model).or_else(|| {
             self.model_profiles
                 .iter()
@@ -1876,31 +1969,43 @@ impl Config {
 
 #[derive(Debug, Clone, Default)]
 struct ResolvedModelProfile {
+    upstream: Option<String>,
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
     roles: Option<RolesConfig>,
     template_family: Option<String>,
-    native_vision: Option<bool>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     reasoning_effort_map: BTreeMap<String, JsonValue>,
     reasoning_effort_default: Option<String>,
     capabilities: Option<CapabilitiesConfig>,
     reasoning_effort: Option<ReasoningConfig>,
+    /// `None` = no profile or template in the `extends` chain set `fallbacks`;
+    /// `Some(_)` = the last profile/template to set it, whole-list (see
+    /// `merge_persisted_model_profile`).
+    fallbacks: Option<Vec<PersistedProfileFallback>>,
+    image_analysis: Option<ImageAnalysisConfig>,
 }
 
 impl ResolvedModelProfile {
     fn into_model_profile(self) -> ModelProfile {
         ModelProfile {
+            upstream: self.upstream,
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
             roles: self.roles,
             template_family: normalize_template_family(self.template_family.as_deref()),
-            native_vision: self.native_vision,
             upstream_chat_kwargs: self.upstream_chat_kwargs,
             reasoning_effort_map: self.reasoning_effort_map,
             reasoning_effort_default: self.reasoning_effort_default,
             capabilities: self.capabilities,
             reasoning_effort: self.reasoning_effort,
+            fallbacks: self
+                .fallbacks
+                .unwrap_or_default()
+                .into_iter()
+                .map(ProfileFallback::from)
+                .collect(),
+            image_analysis: self.image_analysis,
         }
     }
 }
@@ -2081,7 +2186,7 @@ fn resolve_persisted_model_profile(
         stack.pop();
         merge_resolved_model_profile(&mut resolved, template);
     }
-    merge_persisted_model_profile(&mut resolved, profile);
+    merge_persisted_model_profile(&mut resolved, profile)?;
     Ok(resolved)
 }
 
@@ -2089,14 +2194,20 @@ fn merge_resolved_model_profile(
     destination: &mut ResolvedModelProfile,
     source: ResolvedModelProfile,
 ) {
+    if source.upstream.is_some() {
+        destination.upstream = source.upstream;
+    }
     if source.upstream_model.is_some() {
         destination.upstream_model = source.upstream_model;
     }
     if source.template_family.is_some() {
         destination.template_family = source.template_family;
     }
-    if source.native_vision.is_some() {
-        destination.native_vision = source.native_vision;
+    if source.fallbacks.is_some() {
+        destination.fallbacks = source.fallbacks;
+    }
+    if source.image_analysis.is_some() {
+        destination.image_analysis = source.image_analysis;
     }
     if source.roles.is_some() {
         destination.roles = source.roles;
@@ -2131,15 +2242,29 @@ fn merge_resolved_model_profile(
 fn merge_persisted_model_profile(
     destination: &mut ResolvedModelProfile,
     source: &PersistedModelProfile,
-) {
+) -> Result<(), String> {
+    if source.native_vision.is_some() {
+        return Err(
+            "`native_vision` was removed; native image passthrough is the default and `image_analysis` enables the redirect (see README \"Migrating\")"
+                .to_string(),
+        );
+    }
+    if let Some(upstream) = trim_nonempty(source.upstream.as_deref()) {
+        destination.upstream = Some(upstream);
+    }
     if let Some(upstream_model) = trim_nonempty(source.upstream_model.as_deref()) {
         destination.upstream_model = Some(upstream_model);
     }
     if let Some(template_family) = trim_nonempty(source.template_family.as_deref()) {
         destination.template_family = Some(template_family);
     }
-    if source.native_vision.is_some() {
-        destination.native_vision = source.native_vision;
+    if let Some(fallbacks) = &source.fallbacks {
+        destination.fallbacks = Some(fallbacks.clone());
+    }
+    if source.image_analysis.is_some() {
+        destination
+            .image_analysis
+            .clone_from(&source.image_analysis);
     }
     if source.roles.is_some() {
         destination.roles.clone_from(&source.roles);
@@ -2175,6 +2300,7 @@ fn merge_persisted_model_profile(
             .reasoning_effort_default
             .clone_from(&source.reasoning_effort_default);
     }
+    Ok(())
 }
 
 fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<String> {

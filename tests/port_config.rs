@@ -599,3 +599,60 @@ fn upstream_entry_rejects_removed_keys_and_duplicates() {
             .contains("duplicate upstream name")
     );
 }
+
+#[test]
+fn profile_parses_upstream_fallbacks_and_image_analysis() {
+    let yaml = r#"
+upstreams:
+  - { name: local, url: "http://h/v1" }
+  - { name: or, url: "http://o/v1" }
+  - { name: vl, url: "http://v/v1" }
+model_profiles:
+  GLM-5.2:
+    upstream: local
+    fallbacks:
+      - { upstream: or, model: "z-ai/glm-5.2" }
+      - vl
+    image_analysis: { model: Qwen3-VL }
+  Qwen3-VL:
+    upstream: vl
+"#;
+    // Parse-level assertions only: resolve_route lands in Task 5. In this task
+    // the runtime ModelProfile carries `upstream: Option<String>` (no
+    // requiredness validation yet); Task 5 tightens it to `String` and
+    // migrates these assertions to resolve_route.
+    let config = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap();
+    let profile = config.model_profile("GLM-5.2").expect("profile");
+    assert_eq!(profile.upstream.as_deref(), Some("local"));
+    assert_eq!(profile.fallbacks[0].model.as_deref(), Some("z-ai/glm-5.2"));
+    assert_eq!(profile.fallbacks[1].upstream, "vl");
+    assert!(profile.fallbacks[1].model.is_none());
+    assert_eq!(profile.image_analysis.as_ref().unwrap().model, "Qwen3-VL");
+    // The shorthand-kwargs sweep must not let the new typed keys leak in.
+    assert!(profile.upstream_chat_kwargs.is_empty());
+}
+
+#[test]
+fn profile_native_vision_is_a_startup_error() {
+    let yaml = "upstreams: [{ name: l, url: \"http://h/v1\" }]\nmodel_profiles:\n  M: { upstream: l, native_vision: true }\n";
+    let err = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap_err();
+    assert!(
+        err.contains("native_vision") && err.contains("image_analysis"),
+        "{err}"
+    );
+}
+
+#[test]
+fn extends_template_supplies_upstream_and_fallbacks_whole_value() {
+    let yaml = r#"
+upstreams: [{ name: l, url: "http://h/v1" }, { name: o, url: "http://o/v1" }]
+model_profile_templates:
+  routed: { upstream: l, fallbacks: [o] }
+model_profiles:
+  A: { extends: [routed] }
+  B: { extends: [routed], fallbacks: [] }
+"#;
+    let config = Config::from_persisted(&serde_yaml::from_str(yaml).unwrap()).unwrap();
+    assert_eq!(config.model_profile("A").unwrap().fallbacks.len(), 1);
+    assert!(config.model_profile("B").unwrap().fallbacks.is_empty());
+}
