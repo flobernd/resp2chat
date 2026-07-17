@@ -141,12 +141,15 @@ exactly what you observe.";
 /// `analyzer_model` is the profile-selected analyzer (`image_analysis.model`)
 /// the analysis call dispatches to through the gateway's own upstreams like any
 /// request; `residual_images` is the policy the residual sweep applies to an
-/// image the strip did not consume.
+/// image the strip did not consume; `max_tokens`/`max_rounds` come from the
+/// profile's `image_analysis` config (see `ImageAnalysisConfig`).
 #[derive(Debug, Clone)]
 struct ActiveVisionSession {
     id: String,
     analyzer_model: String,
     residual_images: ResidualImagePolicy,
+    max_tokens: i64,
+    max_rounds: usize,
 }
 
 #[derive(Clone)]
@@ -1695,6 +1698,8 @@ impl Gateway {
             id: session_id,
             analyzer_model: image_analysis.model,
             residual_images: image_analysis.residual_images,
+            max_tokens: image_analysis.max_tokens as i64,
+            max_rounds: image_analysis.max_rounds,
         })
     }
 
@@ -2798,12 +2803,19 @@ impl Gateway {
                 }
                 if had_image_analysis {
                     image_analysis_rounds += 1;
-                    // Absolute ceiling on `analyzeImage` rounds — INDEPENDENT of
-                    // the web-search ceiling (AGENTS.md: do not touch
-                    // `WEB_SEARCH_ROUNDS_HARD_CEILING`). A model that re-requests
-                    // image analysis every round must still terminate.
-                    const IMAGE_ANALYSIS_ROUNDS_HARD_CEILING: usize = 8;
-                    if image_analysis_rounds >= IMAGE_ANALYSIS_ROUNDS_HARD_CEILING {
+                    // Per-turn ceiling from the profile's `image_analysis.max_rounds`
+                    // (default 8), independent of the web-search ceiling (AGENTS.md:
+                    // do not touch `WEB_SEARCH_ROUNDS_HARD_CEILING`). A model that
+                    // re-requests image analysis every round must still terminate.
+                    let max_rounds = vision_session
+                        .as_ref()
+                        .ok_or_else(|| {
+                            AppError::internal(
+                                "image analysis round accounted without a vision session",
+                            )
+                        })?
+                        .max_rounds;
+                    if image_analysis_rounds >= max_rounds {
                         return Err(AppError::upstream("image analysis round limit exceeded"));
                     }
                 }
@@ -3437,7 +3449,11 @@ impl Gateway {
                 _ = abort_token.cancelled() => return Err(AppError::cancelled()),
                 result = timeout(
                     self.config.request_timeout,
-                    self.analyze_images_via_upstream(&session.analyzer_model, &vision_request),
+                    self.analyze_images_via_upstream(
+                        &session.analyzer_model,
+                        session.max_tokens,
+                        &vision_request,
+                    ),
                 ) => match result {
                     // Round-3 #3: redact the SUCCESS description before it is
                     // logged (monitor preview below) or injected as a tool
@@ -3494,6 +3510,7 @@ impl Gateway {
     async fn analyze_images_via_upstream(
         &self,
         analyzer_model: &str,
+        max_tokens: i64,
         request: &VisionRequest,
     ) -> AppResult<String> {
         let mut user_content: Vec<Value> = request
@@ -3544,7 +3561,7 @@ impl Gateway {
             stream_options: None,
             temperature: None,
             top_p: None,
-            max_output_tokens: Some(4096),
+            max_output_tokens: Some(max_tokens),
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,

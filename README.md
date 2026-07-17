@@ -418,8 +418,10 @@ model_profiles:
   GLM-5.2:
     upstream: local
     image_analysis:
-      model: Qwen3-VL          # must be an existing exact-key profile
-      residual_images: reject  # default: placeholder
+      model: Qwen3-VL           # must be an existing exact-key profile
+      residual_images: reject   # default: placeholder
+      max_tokens: 8192          # default: 8192
+      max_rounds: 8             # default: 8
 
   Qwen3-VL:
     upstream: vision
@@ -432,7 +434,11 @@ to an image the redirect could not strip - a `file_id` image, one outside the
 latest user turn, or an image left over in older history: `placeholder` (the
 default) replaces it with an instructive text note so the model asks for a
 description instead of guessing; `reject` fails the turn before dispatch with
-an HTTP 400 instead of contacting the upstream.
+an HTTP 400 instead of contacting the upstream. `max_tokens` is the analyzer's
+completion budget; raise it for a thinking-enabled analyzer, which can spend
+the whole default on reasoning before emitting a description. `max_rounds`
+bounds how many `analyzeImage` rounds a single turn may run before the turn
+fails. Both must be non-zero.
 
 ## Migrating
 

@@ -289,6 +289,162 @@ async fn analysis_call_lands_on_analyzer_profile_upstream_with_served_model() {
 }
 
 #[tokio::test]
+async fn analyzer_dispatch_carries_configured_max_tokens() {
+    // The analyzer completion budget comes from the profile's
+    // `image_analysis.max_tokens`, not a hardcoded constant: a thinking-enabled
+    // analyzer can exhaust a small budget on reasoning before emitting content,
+    // so a profile needs to be able to raise it. Two independent wiremock
+    // servers, mirroring `analysis_call_lands_on_analyzer_profile_upstream_with_served_model`.
+    let text_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "tool_calls": [{
+                            "id": "call_img_1",
+                            "index": 0,
+                            "type": "function",
+                            "function": {
+                                "name": "analyzeImage",
+                                "arguments": "{\"imageId\":[\"1\"],\"task\":\"describe\"}"
+                            }
+                        }]},
+                        "finish_reason": "tool_calls"
+                    }]
+                })])),
+        )
+        .up_to_n_times(1)
+        .mount(&text_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-2",
+                    "choices": [{"index": 0, "delta": {"content": "It is a red square."}, "finish_reason": "stop"}]
+                })])),
+        )
+        .mount(&text_server)
+        .await;
+
+    let vision_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "vis-1",
+                    "choices": [{"index": 0, "delta": {"content": "A red square."}, "finish_reason": "stop"}]
+                })])),
+        )
+        .mount(&vision_server)
+        .await;
+
+    let config = common::config_from_yaml(&format!(
+        "upstreams:\n  \
+           - name: text_up\n    url: \"{text}/v1/\"\n  \
+           - name: vision_up\n    url: \"{vision}/v1/\"\n\
+         model_profiles:\n  \
+           \"glm-5.1\":\n    upstream: text_up\n    image_analysis:\n      model: \"vision-analyzer\"\n      max_tokens: 12345\n  \
+           \"vision-analyzer\":\n    upstream: vision_up\n    upstream_model: \"served-vision-model\"\n",
+        text = text_server.uri(),
+        vision = vision_server.uri(),
+    ));
+    let (_app, gateway) = llmconduit::build_app_with_gateway(config);
+
+    let request = base_request(vec![user_message_with_image(
+        "what is this?",
+        TEST_IMAGE_DATA_URL,
+    )]);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let analyzer_posts: Vec<_> = vision_server
+        .received_requests()
+        .await
+        .expect("vision server recorded requests")
+        .into_iter()
+        .filter(|req| req.url.path().ends_with("/chat/completions"))
+        .collect();
+    assert_eq!(
+        analyzer_posts.len(),
+        1,
+        "the analyzer upstream serves the analysis call exactly once"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&analyzer_posts[0].body).expect("analyzer body is JSON");
+    assert_eq!(
+        body["max_tokens"].as_i64(),
+        Some(12345),
+        "the analyzer POST must carry the profile's configured max_tokens: {body}"
+    );
+}
+
+#[tokio::test]
+async fn image_agent_round_ceiling_terminates_loop() {
+    // `image_analysis.max_rounds: 1` caps the analyzeImage loop at one round,
+    // mirroring `web_search_round_ceiling_terminates_loop`. The first round's
+    // analyzer dispatch still runs, but the engine must refuse to start a
+    // second round rather than ask the text model again; only two responses
+    // are queued, so an unbounded (or stale hardcoded-8) loop would panic on
+    // an exhausted response queue instead of failing cleanly.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            "{\"imageId\":[\"1\"],\"task\":\"describe\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk(
+            "vis-1",
+            "A small red square on white.",
+        ))])
+        .await;
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        common::image_analysis_config_with_limits(ResidualImagePolicy::Placeholder, 8192, 1),
+    );
+
+    let request = base_request(vec![user_message_with_image(
+        "what is this?",
+        TEST_IMAGE_DATA_URL,
+    )]);
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    assert_eq!(
+        upstream.requests().await.len(),
+        2,
+        "round 1 dispatch + analyzer dispatch only; the ceiling must block a second round"
+    );
+    let names = event_names(&events);
+    assert!(
+        names.contains(&"response.failed"),
+        "the round ceiling must terminate the turn: {names:?}"
+    );
+    let failed = events
+        .iter()
+        .find(|event| event["_event"] == "response.failed")
+        .expect("response.failed event");
+    let message = failed["response"]["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("image analysis round limit exceeded"),
+        "must surface the existing round-limit error text: {message}"
+    );
+}
+
+#[tokio::test]
 async fn image_analysis_strips_raw_image_bytes_from_upstream() {
     // The text backend must NEVER receive raw image bytes: round 1 carries only
     // the [Image #N] placeholder plus the injected analyzeImage tool.
