@@ -149,7 +149,7 @@ Routing is always on: every `model_profiles` entry names an `upstream:`, validat
 ## Quick gotchas
 
 - `flatten_content` defaults to `true` — multimodal text-only content gets flattened to bare string before going upstream. Some providers expect arrays; the option is configurable.
-- `OPENAI_API_KEY` seeds the `api_key` of any `upstreams:` entry that declares none of its own (per-entry, not a single global fallback).
+- An `upstreams:` entry authenticates only with its own `api_key`; there is no environment fallback (`OPENAI_API_KEY` is not read), so a keyless entry sends no credentials.
 - Chat and Anthropic ingress set canonical `store=false`; raw Responses defaults to `store=true`, enabling replay unless the caller disables it.
 - `/v1/messages` has HEAD/OPTIONS probe routes returning `204` with `Allow: POST, HEAD, OPTIONS`.
 - `/v1/models` is built from `model_profiles` (`profile_models_response`, `http.rs`) and never proxied to an upstream; it is reshaped to Anthropic-style pagination when `anthropic-version` or `anthropic-beta` is present.

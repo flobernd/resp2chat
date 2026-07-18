@@ -2283,13 +2283,6 @@ fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<St
 /// `fallback_upstreams` chain -- those keys are detected here and rejected
 /// with the replacement they migrate to, rather than silently ignored.
 fn parse_upstreams(entries: &[PersistedUpstream]) -> Result<Vec<UpstreamConfig>, String> {
-    // `OPENAI_API_KEY` seeds any entry that declares no `api_key` of its own, so
-    // the common single-endpoint setup authenticates from the environment without
-    // committing a secret to the config file (the top-level fallback this replaces
-    // is gone with the single-upstream knobs).
-    let openai_api_key = env::var("OPENAI_API_KEY")
-        .ok()
-        .and_then(|value| trim_nonempty(Some(&value)));
     let mut seen_names = HashSet::new();
     let mut upstreams = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
@@ -2317,7 +2310,7 @@ fn parse_upstreams(entries: &[PersistedUpstream]) -> Result<Vec<UpstreamConfig>,
         upstreams.push(UpstreamConfig {
             name: name.to_string(),
             url,
-            api_key: trim_nonempty(entry.api_key.as_deref()).or_else(|| openai_api_key.clone()),
+            api_key: trim_nonempty(entry.api_key.as_deref()),
             chat_kwargs: entry.chat_kwargs.clone(),
             request_log_path: trim_nonempty(entry.request_log_path.as_deref()).map(PathBuf::from),
         });
@@ -3030,11 +3023,11 @@ model_profiles:
         assert_eq!(result.unwrap(), PersistedConfig::default());
     }
 
-    /// `OPENAI_API_KEY` seeds the api_key of any `upstreams` entry that declares
-    /// none of its own, resolved at `from_persisted` time; an entry with an
-    /// explicit key is left untouched.
+    /// An upstream authenticates only with its own `api_key`; an ambient
+    /// `OPENAI_API_KEY` must never leak to entries that declare none, since a
+    /// keyless entry may be a local or third-party endpoint.
     #[test]
-    fn openai_env_seeds_entries_without_an_explicit_api_key() {
+    fn openai_env_does_not_seed_entries_without_an_explicit_api_key() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
@@ -3074,14 +3067,13 @@ model_profiles:
             std::env::remove_var("OPENAI_API_KEY");
         }
         assert_eq!(
-            result.upstreams[0].api_key.as_deref(),
-            Some("fallback-key-67890"),
-            "an entry with no api_key inherits OPENAI_API_KEY"
+            result.upstreams[0].api_key, None,
+            "an entry with no api_key must not inherit OPENAI_API_KEY"
         );
         assert_eq!(
             result.upstreams[1].api_key.as_deref(),
             Some("explicit"),
-            "an entry with its own api_key is not overridden"
+            "an entry with its own api_key is unaffected"
         );
     }
 

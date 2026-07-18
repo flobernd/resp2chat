@@ -61,8 +61,8 @@ upstreams:
 
 Each entry also accepts `upstream_base_url`/`upstream_api_key`/
 `upstream_chat_kwargs`/`upstream_request_log_path` as aliases for
-`url`/`api_key`/`chat_kwargs`/`request_log_path`. `OPENAI_API_KEY` seeds the
-`api_key` of any entry that declares none of its own.
+`url`/`api_key`/`chat_kwargs`/`request_log_path`. An entry that omits
+`api_key` sends no credentials; every entry that needs auth declares its own.
 
 An upstream is a pure endpoint: it names no model and carries no fallback
 chain of its own. Routing, model overrides, and failover all live on the
@@ -518,8 +518,9 @@ now only lists exact profile keys, not fallback aliases.
 **Environment overrides.** `LLMCONDUIT_UPSTREAM_BASE_URL`,
 `LLMCONDUIT_UPSTREAM_API_KEY`, and `LLMCONDUIT_UPSTREAM_MODEL` are no longer
 read; set those values on an `upstreams:` entry and a profile instead.
-`OPENAI_API_KEY` still works, but now seeds the `api_key` of every
-`upstreams:` entry that omits its own, not just a single fallback key.
+`OPENAI_API_KEY` is no longer read either: an ambient key must not leak to
+endpoints that never asked for one, so every `upstreams:` entry that needs
+auth declares its own `api_key`.
 
 **`configure` and existing multi-upstream configs.** `llmconduit configure`
 always writes the minimal shape: one `default` upstream plus a `"*"` profile.
@@ -622,13 +623,11 @@ LLMCONDUIT_MAX_REPLAY_ENTRIES
 LLMCONDUIT_FLATTEN_CONTENT
 LLMCONDUIT_TURN_CAPTURE_DIR
 BRAVE_SEARCH_API_KEY
-OPENAI_API_KEY
 ```
 
 `LLMCONDUIT_UPSTREAM_BASE_URL`/`LLMCONDUIT_UPSTREAM_API_KEY`/
-`LLMCONDUIT_UPSTREAM_MODEL` are gone; set those values on an `upstreams:`
-entry and a profile instead (see "Migrating"). `OPENAI_API_KEY` seeds the
-`api_key` of any `upstreams:` entry that declares none of its own.
+`LLMCONDUIT_UPSTREAM_MODEL`/`OPENAI_API_KEY` are gone; set the URL, key, and
+model on an `upstreams:` entry and a profile instead (see "Migrating").
 
 ## Request Logs
 
