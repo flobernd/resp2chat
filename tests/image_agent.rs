@@ -2,7 +2,7 @@
 //!
 //! A profile that declares `image_analysis` opts its (text-only) backend into
 //! the in-proxy vision offload: images in the latest user turn are stripped to
-//! `[Image #N]` placeholders, cached, and an `analyzeImage` server tool is
+//! `<image id="..."/>` markers, cached, and an `analyzeImage` server tool is
 //! injected. When the model calls `analyzeImage`, the engine resolves the cached
 //! image(s) and dispatches them to the analyzer model THROUGH the gateway's own
 //! upstreams (the router resolves that model like any request), then feeds the
@@ -97,13 +97,14 @@ async fn image_analysis_strips_offloads_to_analyzer_then_answers() {
     // normal internal chat request to the `analyzer` model) answers with the
     // description. Round 2: the text model answers using it. Three upstream
     // calls; analyzeImage never leaks to the client.
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
             "chat-1",
             "call_img_1",
             "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"describe\"}",
+            &format!("{{\"imageId\":[\"{id}\"],\"task\":\"describe\"}}"),
         ))])
         .await;
     upstream
@@ -187,6 +188,7 @@ async fn analysis_call_lands_on_analyzer_profile_upstream_with_served_model() {
     // call is dispatched through the gateway's own upstreams by the analyzer
     // profile's model name, so it lands on the ANALYZER profile's upstream and
     // posts that profile's served model. Two independent wiremock servers.
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let text_server = MockServer::start().await;
     // Round 1 on the text upstream: emit an analyzeImage tool call.
     Mock::given(method("POST"))
@@ -204,7 +206,7 @@ async fn analysis_call_lands_on_analyzer_profile_upstream_with_served_model() {
                             "type": "function",
                             "function": {
                                 "name": "analyzeImage",
-                                "arguments": "{\"imageId\":[\"1\"],\"task\":\"describe\"}"
+                                "arguments": format!("{{\"imageId\":[\"{id}\"],\"task\":\"describe\"}}")
                             }
                         }]},
                         "finish_reason": "tool_calls"
@@ -291,7 +293,8 @@ async fn analysis_call_lands_on_analyzer_profile_upstream_with_served_model() {
 #[tokio::test]
 async fn image_analysis_strips_raw_image_bytes_from_upstream() {
     // The text backend must NEVER receive raw image bytes: round 1 carries only
-    // the [Image #N] placeholder plus the injected analyzeImage tool.
+    // the <image id="..."/> marker plus the injected analyzeImage tool.
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "I cannot see images."))])
@@ -310,19 +313,26 @@ async fn image_analysis_strips_raw_image_bytes_from_upstream() {
         !serialized.contains("iVBORw0KGgo"),
         "raw image base64 must not reach the text upstream"
     );
-    assert!(serialized.contains("[Image #1]"), "placeholder present");
+    assert!(
+        // `serialized` is a JSON-serialized string, so the marker's own quotes
+        // appear backslash-escaped in it.
+        serialized.contains(&format!("<image id=\\\"{id}\\\"/>")),
+        "marker present"
+    );
     assert!(offers_analyze_image(&requests[0]));
 }
 
 #[tokio::test]
 async fn image_analysis_handles_multiple_image_ids() {
+    let id1 = llmconduit::vision::image_id_for("data:image/png;base64,AAAAMARKER");
+    let id2 = llmconduit::vision::image_id_for("data:image/png;base64,BBBBMARKER");
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
             "chat-1",
             "call_img_1",
             "analyzeImage",
-            "{\"imageId\":[\"1\",\"2\"],\"task\":\"compare\"}",
+            &format!("{{\"imageId\":[\"{id1}\",\"{id2}\"],\"task\":\"compare\"}}"),
         ))])
         .await;
     upstream
@@ -366,10 +376,191 @@ async fn image_analysis_handles_multiple_image_ids() {
 }
 
 #[tokio::test]
+async fn client_image_markers_preserved_and_wrong_id_gets_correction() {
+    // The latest turn carries two images PLUS the client's own session-continuous
+    // [Image #6]/[Image #7] text markers. Those markers are inert under
+    // content-hash ids (a numeric id can only miss the cache, never hit a wrong
+    // image) so the stripped upstream body preserves them verbatim alongside
+    // conduit's hash markers. An analyzeImage call using the client's WRONG ids
+    // yields a model-visible correction listing the session's valid ids:
+    // resolution is exact-only, so a foreign id is reported rather than
+    // positionally guessed.
+    let id1 = llmconduit::vision::image_id_for("data:image/png;base64,AAAAMARKER");
+    let id2 = llmconduit::vision::image_id_for("data:image/png;base64,BBBBMARKER");
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            "{\"imageId\":[\"6\",\"7\"],\"task\":\"compare\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "Both differ."))])
+        .await;
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
+
+    let request = base_request(vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "[Image #6] [Image #7] compare these".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,AAAAMARKER".to_string()),
+                file_id: None,
+                detail: None,
+            },
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,BBBBMARKER".to_string()),
+                file_id: None,
+                detail: None,
+            },
+        ],
+        phase: None,
+    }]);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    // Round 1 to the text model: conduit's hash markers AND the client's own
+    // markers both survive, since they are two ids that can never collide.
+    let round1 = serde_json::to_string(&requests[0]).expect("serialize");
+    // `round1` is a JSON-serialized string, so the markers' own quotes appear
+    // backslash-escaped in it.
+    assert!(
+        round1.contains(&format!("<image id=\\\"{id1}\\\"/>")),
+        "conduit marker 1 present: {round1}"
+    );
+    assert!(
+        round1.contains(&format!("<image id=\\\"{id2}\\\"/>")),
+        "conduit marker 2 present"
+    );
+    assert!(round1.contains("[Image #6]"), "client marker 6 preserved");
+    assert!(round1.contains("[Image #7]"), "client marker 7 preserved");
+    assert!(!round1.contains("AAAAMARKER"), "no raw bytes to text model");
+    assert!(!round1.contains("BBBBMARKER"), "no raw bytes to text model");
+
+    // Both requested ids miss, so the analyzer is never dispatched: only the two
+    // text-model turns show up on the upstream.
+    assert_eq!(
+        requests.len(),
+        2,
+        "analyzer not dispatched when every id is unresolved"
+    );
+    let round2 = requests[1]
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .and_then(|m| m.content.as_ref())
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        round2.contains("no image found for id(s) \"6\", \"7\""),
+        "wrong ids surfaced: {round2}"
+    );
+    assert!(
+        round2.contains(&format!(
+            "Valid image ids in this conversation: \"{id1}\", \"{id2}\""
+        )),
+        "valid ids listed: {round2}"
+    );
+}
+
+#[tokio::test]
+async fn partial_miss_analyzes_valid_id_and_appends_correction_for_wrong_id() {
+    // A partial miss: one requested id resolves, the other ("6") does not.
+    // Resolution is exact-only and per-id, so the valid id still triggers an
+    // analyzer dispatch; the wrong id is surfaced by appending
+    // `vision_unresolved_note` to the analyzer's own text, giving the model
+    // both the analysis AND the correction in one round.
+    let id1 = llmconduit::vision::image_id_for("data:image/png;base64,AAAAMARKER");
+    let id2 = llmconduit::vision::image_id_for("data:image/png;base64,BBBBMARKER");
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_img_1",
+            "analyzeImage",
+            &format!("{{\"imageId\":[\"{id1}\",\"6\"],\"task\":\"describe\"}}"),
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("vis-1", "A red square on white."))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "Here is what I found."))])
+        .await;
+    let gateway = image_agent_gateway(
+        upstream.clone(),
+        image_analysis_config(ResidualImagePolicy::Placeholder),
+    );
+
+    let request = base_request(vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "describe these".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,AAAAMARKER".to_string()),
+                file_id: None,
+                detail: None,
+            },
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,BBBBMARKER".to_string()),
+                file_id: None,
+                detail: None,
+            },
+        ],
+        phase: None,
+    }]);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    // Unlike a total miss, the valid id still resolves, so the analyzer IS
+    // dispatched exactly once: text round 1 + analyzer dispatch + text round 2.
+    assert_eq!(
+        requests.len(),
+        3,
+        "analyzer dispatched exactly once despite one wrong id"
+    );
+    assert_eq!(requests[1].model, "analyzer", "analyzer model dispatched");
+
+    // The follow-up upstream request carries the tool result: the analyzer's
+    // own description text PLUS the appended correction for the wrong id.
+    // `round2` is a JSON-serialized string, so the note's own quotes appear
+    // backslash-escaped in it (same convention as the marker checks above).
+    let round2 = serde_json::to_string(&requests[2]).expect("serialize");
+    assert!(
+        round2.contains("A red square on white."),
+        "analyzer description present: {round2}"
+    );
+    assert!(
+        round2.contains("no image found for id(s) \\\"6\\\""),
+        "wrong id surfaced: {round2}"
+    );
+    assert!(
+        round2.contains(&format!(
+            "Valid image ids in this conversation: \\\"{id1}\\\", \\\"{id2}\\\""
+        )),
+        "valid ids listed: {round2}"
+    );
+}
+
+#[tokio::test]
 async fn image_analysis_cache_miss_becomes_model_visible_text() {
-    // The model asks for an image id that was never cached (#5 when only #1
-    // exists). The executor injects a "no cached image" message and never
-    // dispatches the analyzer, so there are only two upstream calls.
+    // The session cache is genuinely EMPTY: the only image is a `file_id` shape
+    // the strip never caches (it caches `image_url` images only), so the residual
+    // sweep degrades it and nothing is cacheable. A wholly unresolvable
+    // analyzeImage call therefore resolves no images, so the executor injects a
+    // model-visible correction (listing no valid ids) and never dispatches the
+    // analyzer - only two upstream calls.
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
@@ -387,7 +578,10 @@ async fn image_analysis_cache_miss_becomes_model_visible_text() {
         image_analysis_config(ResidualImagePolicy::Placeholder),
     );
 
-    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    let request = base_request(vec![message_with_role_and_image(
+        "user",
+        file_id_image("file-uncacheable"),
+    )]);
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
     assert!(event_names(&events).contains(&"response.completed"));
@@ -400,20 +594,22 @@ async fn image_analysis_cache_miss_becomes_model_visible_text() {
         .and_then(|m| m.content.as_ref())
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    assert!(tool_msg.contains("no cached image found"));
+    assert!(tool_msg.contains("no image found for id(s) \"5\""));
+    assert!(tool_msg.contains("no images are currently cached"));
 }
 
 #[tokio::test]
 async fn analyzer_failure_surfaces_as_tool_result_error_without_killing_turn() {
     // Controller 5e: an analyzer dispatch failure degrades to model-visible tool
     // text (matching the Brave web_search contract) so the turn still completes.
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
             "chat-1",
             "call_img_1",
             "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
+            &format!("{{\"imageId\":[\"{id}\"],\"task\":\"x\"}}"),
         ))])
         .await;
     // The analyzer dispatch stream yields an error.
@@ -452,13 +648,14 @@ async fn analyzer_failure_surfaces_as_tool_result_error_without_killing_turn() {
 async fn image_analysis_redacts_data_url_in_successful_analyzer_text() {
     // A SUCCESSFUL analyzer description that echoes a data:/signed URL must be
     // redacted before it is injected as the tool result (and logged).
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
             "chat-1",
             "call_img_1",
             "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
+            &format!("{{\"imageId\":[\"{id}\"],\"task\":\"x\"}}"),
         ))])
         .await;
     upstream
@@ -515,6 +712,7 @@ async fn image_analysis_keeps_parallel_tool_calls_false_upstream() {
 async fn image_analysis_rejects_mixed_client_and_analyze_image() {
     // analyzeImage (server) + a client function tool in the same batch is
     // rejected, exactly like web_search + client.
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(ChatCompletionChunk {
@@ -531,9 +729,9 @@ async fn image_analysis_rejects_mixed_client_and_analyze_image() {
                             kind: "function".to_string(),
                             function: ChatFunctionCall {
                                 name: Some("analyzeImage".to_string()),
-                                arguments: Some(serde_json::Value::String(
-                                    "{\"imageId\":[\"1\"],\"task\":\"x\"}".to_string(),
-                                )),
+                                arguments: Some(serde_json::Value::String(format!(
+                                    "{{\"imageId\":[\"{id}\"],\"task\":\"x\"}}"
+                                ))),
                             },
                         },
                         ChatToolCall {
@@ -576,13 +774,14 @@ async fn image_analysis_rejects_mixed_client_and_analyze_image() {
 
 #[tokio::test]
 async fn image_analysis_not_leaked_in_chat_completions() {
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
             "chat-1",
             "call_img_1",
             "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
+            &format!("{{\"imageId\":[\"{id}\"],\"task\":\"x\"}}"),
         ))])
         .await;
     upstream
@@ -630,13 +829,17 @@ async fn image_analysis_not_leaked_in_chat_completions() {
 
 #[tokio::test]
 async fn image_analysis_not_leaked_in_anthropic_messages() {
+    // The Anthropic base64 image lowers to the same canonical data URL as
+    // `TEST_IMAGE_DATA_URL` (`format!("data:{media_type};base64,{data}")`), so
+    // its content-derived id is computed the same way.
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
             "chat-1",
             "call_img_1",
             "analyzeImage",
-            "{\"imageId\":[\"1\"],\"task\":\"x\"}",
+            &format!("{{\"imageId\":[\"{id}\"],\"task\":\"x\"}}"),
         ))])
         .await;
     upstream
@@ -697,6 +900,7 @@ async fn no_image_analysis_passes_data_url_through_unmodified() {
     // The data-URL image reaches the profile's upstream UNMODIFIED, even though
     // the model name ("glm-5.1") is not a known vision model - the name sniff is
     // gone.
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "I can see it."))])
@@ -715,8 +919,9 @@ async fn no_image_analysis_passes_data_url_through_unmodified() {
         "the raw image survives to the upstream unmodified: {serialized}"
     );
     assert!(
-        !serialized.contains("[Image #1]"),
-        "no placeholder rewrite on the passthrough path"
+        // `serialized` is JSON, so the marker's own quotes appear escaped in it.
+        !serialized.contains(&format!("<image id=\\\"{id}\\\"/>")),
+        "no marker rewrite on the passthrough path"
     );
     assert!(
         !offers_analyze_image(&requests[0]),
@@ -896,6 +1101,7 @@ async fn active_agent_degrades_old_residual_but_strips_latest_image() {
     // The two seams cooperate: the LATEST user image_url is stripped+cached
     // (analyzeImage-referenceable), while an OLDER `file_id` residual the strip
     // cannot see is degraded to a placeholder by the sweep.
+    let id = llmconduit::vision::image_id_for(TEST_IMAGE_DATA_URL);
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
@@ -920,8 +1126,9 @@ async fn active_agent_degrades_old_residual_but_strips_latest_image() {
         "old file_id degraded"
     );
     assert!(
-        serialized.contains("[Image #1]"),
-        "latest image placeholder"
+        // `serialized` is JSON, so the marker's own quotes appear escaped in it.
+        serialized.contains(&format!("<image id=\\\"{id}\\\"/>")),
+        "latest image marker"
     );
     assert!(serialized.contains("this model is text-only and cannot view images"));
 }
