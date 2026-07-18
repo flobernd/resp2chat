@@ -1045,7 +1045,7 @@ impl From<PersistedProfileFallback> for ProfileFallback {
     fn from(persisted: PersistedProfileFallback) -> Self {
         Self {
             upstream: persisted.upstream,
-            model: persisted.model,
+            model: trim_nonempty(persisted.model.as_deref()),
         }
     }
 }
@@ -3825,6 +3825,31 @@ model_profiles:
             config.resolve_system_prompt_prefix("mimo-v2.5").as_deref(),
             Some("Lower prefix.")
         );
+    }
+
+    #[test]
+    fn normalizes_profile_fallback_model_overrides() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstreams:
+  - { name: backend, url: "http://h/v1" }
+  - { name: padded, url: "http://h/v1" }
+  - { name: blank, url: "http://h/v1" }
+model_profiles:
+  served-model:
+    upstream: backend
+    fallbacks:
+      - { upstream: padded, model: "  model-x  " }
+      - { upstream: blank, model: "   " }
+"#,
+        )
+        .expect("yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+        let profile = config.model_profile("served-model").expect("profile");
+        assert_eq!(profile.fallbacks[0].model.as_deref(), Some("model-x"));
+        // Whitespace-only must clear to None so failover dispatch falls back
+        // to the served model instead of posting a blank one.
+        assert_eq!(profile.fallbacks[1].model, None);
     }
 
     #[test]
