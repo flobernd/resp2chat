@@ -1115,6 +1115,10 @@ pub struct PersistedUpstream {
         skip_serializing_if = "Option::is_none"
     )]
     pub api_key: Option<String>,
+    /// Name of an environment variable to read the API key from at startup,
+    /// so the secret itself can stay out of the config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
     #[serde(
         default,
         alias = "upstream_chat_kwargs",
@@ -1319,6 +1323,7 @@ impl Default for PersistedConfig {
                 name: "default".to_string(),
                 url: DEFAULT_UPSTREAM_BASE_URL.to_string(),
                 api_key: None,
+                api_key_env: None,
                 chat_kwargs: JsonMap::new(),
                 request_log_path: None,
                 upstream_model: None,
@@ -2307,10 +2312,35 @@ fn parse_upstreams(entries: &[PersistedUpstream]) -> Result<Vec<UpstreamConfig>,
         }
         let url = Url::parse(entry.url.trim())
             .map_err(|err| format!("invalid upstreams[{index}].url: {err}"))?;
+        // `api_key_env` resolves once at startup so the secret stays out of the
+        // config file; a declared-but-missing variable fails loud here rather
+        // than surfacing later as upstream 401s.
+        let api_key = match (
+            trim_nonempty(entry.api_key.as_deref()),
+            trim_nonempty(entry.api_key_env.as_deref()),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "upstreams[{name}]: `api_key` and `api_key_env` are mutually exclusive; set one or the other"
+                ));
+            }
+            (key, None) => key,
+            (None, Some(var)) => match env::var(&var)
+                .ok()
+                .and_then(|value| trim_nonempty(Some(&value)))
+            {
+                Some(key) => Some(key),
+                None => {
+                    return Err(format!(
+                        "upstreams[{name}]: `api_key_env` names {var:?}, but that environment variable is unset or blank"
+                    ));
+                }
+            },
+        };
         upstreams.push(UpstreamConfig {
             name: name.to_string(),
             url,
-            api_key: trim_nonempty(entry.api_key.as_deref()),
+            api_key,
             chat_kwargs: entry.chat_kwargs.clone(),
             request_log_path: trim_nonempty(entry.request_log_path.as_deref()).map(PathBuf::from),
         });
@@ -2951,6 +2981,7 @@ model_profiles:
                 name: " local ".to_string(),
                 url: " http://127.0.0.1:8000/v1 ".to_string(),
                 api_key: Some(" local-secret ".to_string()),
+                api_key_env: None,
                 chat_kwargs: JsonMap::from_iter([(
                     "chat_template_kwargs".to_string(),
                     json!({"thinking": true}),
@@ -2997,6 +3028,7 @@ model_profiles:
                 name: "local".to_string(),
                 url: "http://127.0.0.1:8000/v1".to_string(),
                 api_key: None,
+                api_key_env: None,
                 chat_kwargs: JsonMap::new(),
                 request_log_path: None,
                 upstream_model: None,
@@ -3038,6 +3070,7 @@ model_profiles:
                     name: "no-key".to_string(),
                     url: "http://127.0.0.1:8000/v1".to_string(),
                     api_key: None,
+                    api_key_env: None,
                     chat_kwargs: JsonMap::new(),
                     request_log_path: None,
                     upstream_model: None,
@@ -3047,6 +3080,7 @@ model_profiles:
                     name: "own-key".to_string(),
                     url: "http://127.0.0.1:8001/v1".to_string(),
                     api_key: Some("explicit".to_string()),
+                    api_key_env: None,
                     chat_kwargs: JsonMap::new(),
                     request_log_path: None,
                     upstream_model: None,
@@ -3075,6 +3109,97 @@ model_profiles:
             Some("explicit"),
             "an entry with its own api_key is unaffected"
         );
+    }
+
+    fn config_with_one_upstream(upstream: PersistedUpstream) -> PersistedConfig {
+        let name = upstream.name.clone();
+        PersistedConfig {
+            upstreams: vec![upstream],
+            model_profiles: OrderedModelProfiles(vec![(
+                "*".to_string(),
+                PersistedModelProfile {
+                    upstream: Some(name),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
+            ..PersistedConfig::default()
+        }
+    }
+
+    /// `api_key_env` resolves the named variable once at startup; the value is
+    /// trimmed like a literal `api_key`. Parses from YAML so the on-disk field
+    /// spelling is covered as well.
+    #[test]
+    fn api_key_env_resolves_from_environment() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_TEST_ENTRY_KEY", "  env-secret  ");
+        }
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstreams:
+  - { name: env-auth, url: "http://127.0.0.1:8000/v1", api_key_env: LLMCONDUIT_TEST_ENTRY_KEY }
+model_profiles:
+  "*":
+    upstream: env-auth
+"#,
+        )
+        .expect("yaml");
+        let result = Config::from_persisted(&persisted);
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TEST_ENTRY_KEY");
+        }
+        let result = result.expect("config");
+        assert_eq!(result.upstreams[0].api_key.as_deref(), Some("env-secret"));
+    }
+
+    /// Declaring `api_key_env` states intent to authenticate, so a missing or
+    /// blank variable must fail at startup instead of surfacing as 401s later.
+    #[test]
+    fn api_key_env_with_unset_variable_is_a_startup_error() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TEST_ENTRY_KEY_UNSET");
+        }
+        let config = config_with_one_upstream(PersistedUpstream {
+            name: "env-auth".to_string(),
+            url: "http://127.0.0.1:8000/v1".to_string(),
+            api_key: None,
+            api_key_env: Some("LLMCONDUIT_TEST_ENTRY_KEY_UNSET".to_string()),
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
+            upstream_model: None,
+            fallback_upstreams: None,
+        });
+        let error = Config::from_persisted(&config).expect_err("startup error");
+        assert!(
+            error.contains("env-auth") && error.contains("LLMCONDUIT_TEST_ENTRY_KEY_UNSET"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn api_key_and_api_key_env_are_mutually_exclusive() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_TEST_ENTRY_KEY_BOTH", "env-secret");
+        }
+        let config = config_with_one_upstream(PersistedUpstream {
+            name: "env-auth".to_string(),
+            url: "http://127.0.0.1:8000/v1".to_string(),
+            api_key: Some("literal".to_string()),
+            api_key_env: Some("LLMCONDUIT_TEST_ENTRY_KEY_BOTH".to_string()),
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
+            upstream_model: None,
+            fallback_upstreams: None,
+        });
+        let result = Config::from_persisted(&config);
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TEST_ENTRY_KEY_BOTH");
+        }
+        let error = result.expect_err("startup error");
+        assert!(error.contains("mutually exclusive"), "{error}");
     }
 
     #[test]
@@ -3359,6 +3484,7 @@ model_profiles:
             name: "backend".to_string(),
             url: "http://h/v1".to_string(),
             api_key: None,
+            api_key_env: None,
             chat_kwargs: JsonMap::new(),
             request_log_path: None,
             upstream_model: None,
@@ -4329,6 +4455,7 @@ model_profiles:
                 name: "routing".to_string(),
                 url: "http://127.0.0.1:8000/v1".to_string(),
                 api_key: None,
+                api_key_env: None,
                 chat_kwargs: JsonMap::new(),
                 request_log_path: Some("/tmp/llmconduit-routing/primary.jsonl".to_string()),
                 upstream_model: None,
@@ -4391,6 +4518,7 @@ model_profiles:
                 name: "routing".to_string(),
                 url: "http://127.0.0.1:8000/v1".to_string(),
                 api_key: None,
+                api_key_env: None,
                 chat_kwargs: JsonMap::new(),
                 request_log_path: None,
                 upstream_model: None,

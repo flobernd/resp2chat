@@ -92,10 +92,19 @@ fn build_configured_persisted_config(
     existing: &PersistedConfig,
     inputs: ConfigureFlowInputs,
 ) -> PersistedConfig {
+    // `api_key_env` is an advanced knob the wizard never prompts for; carry it
+    // through unchanged unless a literal key was entered, since setting both on
+    // one entry is a startup error.
+    let api_key_env = if inputs.upstream_api_key.is_none() {
+        existing_default_upstream(existing).and_then(|entry| entry.api_key_env.clone())
+    } else {
+        None
+    };
     let default_upstream = PersistedUpstream {
         name: "default".to_string(),
         url: inputs.upstream_base_url,
         api_key: inputs.upstream_api_key,
+        api_key_env,
         chat_kwargs: inputs.upstream_chat_kwargs,
         request_log_path: (!inputs.upstream_request_log_path.trim().is_empty())
             .then(|| inputs.upstream_request_log_path.trim().to_string()),
@@ -360,11 +369,37 @@ mod tests {
         assert_eq!(route.served_model, "my-model");
     }
 
+    /// `api_key_env` is never prompted for, so rewriting the config must not
+    /// silently drop it; a freshly entered literal key replaces it instead,
+    /// since one entry may not set both.
+    #[test]
+    fn wizard_preserves_api_key_env_unless_a_literal_key_is_entered() {
+        let mut entry = upstream_named("default", "http://127.0.0.1:8000/v1");
+        entry.api_key_env = Some("MY_KEY_VAR".to_string());
+        let existing = PersistedConfig {
+            upstreams: vec![entry],
+            ..PersistedConfig::default()
+        };
+
+        let mut inputs = base_inputs();
+        inputs.upstream_api_key = None;
+        let persisted = build_configured_persisted_config(&existing, inputs);
+        assert_eq!(
+            persisted.upstreams[0].api_key_env.as_deref(),
+            Some("MY_KEY_VAR")
+        );
+
+        let persisted = build_configured_persisted_config(&existing, base_inputs());
+        assert_eq!(persisted.upstreams[0].api_key_env, None);
+        assert_eq!(persisted.upstreams[0].api_key.as_deref(), Some("secret"));
+    }
+
     fn upstream_named(name: &str, url: &str) -> PersistedUpstream {
         PersistedUpstream {
             name: name.to_string(),
             url: url.to_string(),
             api_key: None,
+            api_key_env: None,
             chat_kwargs: JsonMap::new(),
             request_log_path: None,
             upstream_model: None,

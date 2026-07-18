@@ -62,7 +62,11 @@ upstreams:
 Each entry also accepts `upstream_base_url`/`upstream_api_key`/
 `upstream_chat_kwargs`/`upstream_request_log_path` as aliases for
 `url`/`api_key`/`chat_kwargs`/`request_log_path`. An entry that omits
-`api_key` sends no credentials; every entry that needs auth declares its own.
+`api_key` sends no credentials; every entry that needs auth declares its own,
+either inline or as `api_key_env: SOME_VAR`, which reads the key from that
+environment variable at startup. Declaring `api_key_env` for a variable that
+is unset or blank is a startup error, and one entry may not set both
+`api_key` and `api_key_env`.
 
 An upstream is a pure endpoint: it names no model and carries no fallback
 chain of its own. Routing, model overrides, and failover all live on the
@@ -518,9 +522,11 @@ now only lists exact profile keys, not fallback aliases.
 **Environment overrides.** `LLMCONDUIT_UPSTREAM_BASE_URL`,
 `LLMCONDUIT_UPSTREAM_API_KEY`, and `LLMCONDUIT_UPSTREAM_MODEL` are no longer
 read; set those values on an `upstreams:` entry and a profile instead.
-`OPENAI_API_KEY` is no longer read either: an ambient key must not leak to
-endpoints that never asked for one, so every `upstreams:` entry that needs
-auth declares its own `api_key`.
+`OPENAI_API_KEY` is no longer read implicitly: an ambient key must not leak
+to endpoints that never asked for one, so every `upstreams:` entry that needs
+auth declares its own `api_key`. To keep sourcing the key from the
+environment, opt in per entry with `api_key_env: OPENAI_API_KEY` (or any
+other variable name).
 
 **`configure` and existing multi-upstream configs.** `llmconduit configure`
 always writes the minimal shape: one `default` upstream plus a `"*"` profile.
@@ -627,7 +633,9 @@ BRAVE_SEARCH_API_KEY
 
 `LLMCONDUIT_UPSTREAM_BASE_URL`/`LLMCONDUIT_UPSTREAM_API_KEY`/
 `LLMCONDUIT_UPSTREAM_MODEL`/`OPENAI_API_KEY` are gone; set the URL, key, and
-model on an `upstreams:` entry and a profile instead (see "Migrating").
+model on an `upstreams:` entry and a profile instead (see "Migrating"). An
+entry can still source its key from any environment variable by naming it in
+`api_key_env`.
 
 ## Request Logs
 
