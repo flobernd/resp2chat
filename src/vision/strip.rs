@@ -1,6 +1,6 @@
-//! Request-mutation seam for the image agent: strip images to `[Image #N]`
-//! placeholders, cache the originals, and inject the `analyzeImage` tool +
-//! system-prompt instruction.
+//! Request-mutation seam for the image agent: strip images to
+//! `<image id="..."/>` markers, cache the originals, and inject the
+//! `analyzeImage` tool + system-prompt instruction.
 //!
 //! This is the SINGLE place a [`ResponsesRequest`] is rewritten for the image
 //! agent. It runs BEFORE replay/lowering (`Gateway::stream_responses`) so replay
@@ -14,6 +14,8 @@ use crate::models::responses::ResponsesRequest;
 use crate::models::responses::ToolSpec;
 use serde_json::Value;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 
 use super::cache::CachedImage;
 use super::cache::ImageCache;
@@ -25,22 +27,24 @@ pub const ANALYZE_IMAGE_TOOL_NAME: &str = "analyzeImage";
 /// System-prompt block prepended when the image agent is active, instructing the
 /// (image-blind) text model to call `analyzeImage` before answering. Adapted
 /// from claude-relay's `IMAGE_AGENT_SYSTEM_PROMPT`.
-pub const IMAGE_AGENT_SYSTEM_PROMPT: &str = "CRITICAL INSTRUCTION — IMAGE HANDLING:\n\
-You CANNOT see images. All images are replaced with [Image #N] placeholders which are OPAQUE to you.\n\
-When the latest user message contains [Image #N], you MUST call the `analyzeImage` tool \
+pub const IMAGE_AGENT_SYSTEM_PROMPT: &str = "CRITICAL INSTRUCTION - IMAGE HANDLING:\n\
+You CANNOT see images. All images are replaced with <image id=\"...\"/> markers which are OPAQUE to you.\n\
+When the latest user message contains <image id=\"...\"/> markers, you MUST call the `analyzeImage` tool \
 as your FIRST action BEFORE generating any text response.\n\
 - You have NO ability to see, interpret, or guess what is in an image without calling analyzeImage.\n\
 - If you respond about an image without calling analyzeImage first, your response WILL be wrong.\n\
-- Call analyzeImage with ALL image IDs from the latest message.\n\
-This is non-negotiable. ALWAYS call analyzeImage when [Image #N] is present.";
+- Make ONE analyzeImage call that batches ALL <image id=\"...\"/> ids from the latest message into a single imageId array.\n\
+- Image ids are opaque strings: copy each id EXACTLY as it appears in the marker's id attribute. IGNORE any \
+other image numbering that appears in the text (for example \"[Image #3]\" or \"image 2\").\n\
+This is non-negotiable. ALWAYS call analyzeImage when <image id=\"...\"/> is present.";
 
 /// Description for the injected `analyzeImage` tool (claude-relay's
 /// `ANALYZE_IMAGE_TOOL` description).
 pub const ANALYZE_IMAGE_TOOL_DESCRIPTION: &str = "MANDATORY tool for viewing images. You CANNOT \
-see images directly — [Image #N] placeholders are opaque to you. The ONLY way to see image content \
-is by calling this tool. You MUST call analyzeImage BEFORE writing ANY response when the latest \
-user message contains [Image #N]. NEVER describe, guess, or comment on image content without \
-calling this tool first.";
+see images directly - <image id=\"...\"/> markers are opaque to you. The ONLY way to see image \
+content is by calling this tool. You MUST call analyzeImage BEFORE writing ANY response when the \
+latest user message contains <image id=\"...\"/>. NEVER describe, guess, or comment on image \
+content without calling this tool first.";
 
 /// JSON-schema parameters for the injected `analyzeImage` tool.
 pub fn analyze_image_tool_parameters() -> Value {
@@ -49,7 +53,7 @@ pub fn analyze_image_tool_parameters() -> Value {
         "properties": {
             "imageId": {
                 "type": "array",
-                "description": "Image IDs to analyze — extract from [Image #N] placeholders (e.g. [Image #1] → \"1\")",
+                "description": "Image ids to analyze. Copy each id EXACTLY from the <image id=\"...\"/> markers (e.g. <image id=\"a1b2c3d4e5f6a7b8\"/> -> \"a1b2c3d4e5f6a7b8\"). Batch ALL visible image ids from the latest message into this ONE array; never make separate analyzeImage calls.",
                 "items": { "type": "string" }
             },
             "task": {
@@ -77,12 +81,28 @@ pub fn analyze_image_tool_spec() -> ToolSpec {
     }
 }
 
-/// Placeholder text that replaces a stripped image. Numbered sequentially within
-/// a single request, matching claude-relay's `[Image #N]` format so the model is
-/// told exactly how to reference the image when calling `analyzeImage`.
-fn image_placeholder_text(number: usize) -> String {
+/// Content-derived image id: the first 16 lowercase hex chars of the SHA-256 of
+/// the image's `image_url` (data URL or remote URL). Content addressing keeps
+/// an id stable across requests and history rewrites (e.g. client-side
+/// compaction), and it can never collide with a client's own numeric
+/// "[Image #N]" markers: a wrong id can only MISS the cache and get a
+/// corrective note, never silently hit the wrong image. 64 bits also make
+/// same-session aliasing of two distinct images vanishingly unlikely even at
+/// the cache's image cap.
+pub fn image_id_for(image_url: &str) -> String {
+    let digest = Sha256::digest(image_url.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// Placeholder text that replaces a stripped image. The marker carries the
+/// image's content-derived id in an XML-style attribute so the model copies an
+/// opaque token verbatim instead of interpreting a numbering scheme.
+fn image_placeholder_text(id: &str) -> String {
     format!(
-        "[Image #{number}] — YOU CANNOT SEE THIS IMAGE. Call analyzeImage(imageId=[\"{number}\"]) to view it."
+        "<image id=\"{id}\"/> - YOU CANNOT SEE THIS IMAGE. To view it, make ONE analyzeImage \
+         call that batches \"{id}\" together with every other <image id=.../> id in the latest \
+         message (e.g. analyzeImage(imageId=[\"a1b2c3d4e5f6a7b8\",\"c9d0e1f2a3b4c5d6\"])). Ignore any other \
+         image references or numbering written in the text."
     )
 }
 
@@ -93,17 +113,13 @@ impl ImageCache {
     ///
     /// This is the SINGLE mutation surface (called from `Gateway::stream_responses`
     /// BEFORE replay/lowering) so replay hashes only ever see placeholder text,
-    /// never image bytes. Walks ALL user messages so a multi-turn history is
-    /// renumbered consistently; the cache is cleared first so numbering resets
-    /// per request exactly like claude-relay's stateless processing.
-    ///
-    /// The engine only calls this once it has decided the image agent is active
-    /// for the turn. We renumber every user-message image (not just the latest)
-    /// because the history the client resends still contains earlier raw images
-    /// that would otherwise leak bytes upstream.
+    /// never image bytes. Walks ALL user messages because the history a client
+    /// resends still contains earlier raw images that must not leak upstream;
+    /// each image is cached under its content-derived id ([`image_id_for`]), so
+    /// ids are identical across turns. The session cache is cleared first so it
+    /// always mirrors exactly the images present in this request.
     pub fn strip_and_cache_images(&self, request: &mut ResponsesRequest, session_id: &str) {
         self.clear_session(session_id);
-        let mut counter = 1usize;
         for item in &mut request.input {
             let ResponseItem::Message { role, content, .. } = item else {
                 continue;
@@ -118,7 +134,8 @@ impl ImageCache {
                     ..
                 } = part
                 {
-                    let key = Self::image_key(session_id, &counter.to_string());
+                    let id = image_id_for(image_url);
+                    let key = Self::image_key(session_id, &id);
                     self.store(
                         session_id,
                         key,
@@ -128,9 +145,8 @@ impl ImageCache {
                         },
                     );
                     *part = ContentItem::InputText {
-                        text: image_placeholder_text(counter),
+                        text: image_placeholder_text(&id),
                     };
-                    counter += 1;
                 }
             }
         }
@@ -364,8 +380,10 @@ mod tests {
     }
 
     #[test]
-    fn strip_replaces_images_with_ordered_placeholders() {
+    fn strip_replaces_images_with_id_marker_placeholders() {
         let cache = cache();
+        let id1 = image_id_for("data:img1");
+        let id2 = image_id_for("data:img2");
         let mut req = base_request(vec![user_with(vec![
             ContentItem::InputText {
                 text: "Look at".into(),
@@ -382,19 +400,19 @@ mod tests {
         let ContentItem::InputText { text } = &content[1] else {
             panic!("expected placeholder");
         };
-        assert!(text.contains("[Image #1]"));
-        assert!(text.contains("analyzeImage(imageId=[\"1\"])"));
+        assert!(text.contains(&format!("<image id=\"{id1}\"/>")));
+        assert!(text.contains(&format!("batches \"{id1}\"")));
         let ContentItem::InputText { text } = &content[3] else {
             panic!("expected placeholder");
         };
-        assert!(text.contains("[Image #2]"));
+        assert!(text.contains(&format!("<image id=\"{id2}\"/>")));
         // Originals cached under session-scoped keys.
         assert_eq!(
-            cache.get("sess", &ImageCache::image_key("sess", "1")),
+            cache.get("sess", &ImageCache::image_key("sess", &id1)),
             Some(img("data:img1"))
         );
         assert_eq!(
-            cache.get("sess", &ImageCache::image_key("sess", "2")),
+            cache.get("sess", &ImageCache::image_key("sess", &id2)),
             Some(img("data:img2"))
         );
     }
@@ -558,10 +576,14 @@ mod tests {
     }
 
     #[test]
-    fn strip_renumbers_across_all_user_messages() {
-        // History resent with raw images across two user turns must renumber
-        // 1,2,3 sequentially so no raw bytes survive in any user message.
+    fn strip_replaces_images_across_all_user_messages_with_content_ids() {
+        // History resent with raw images across two user turns must all be
+        // stripped so no raw bytes survive in any user message, each keeping
+        // its own content-derived id regardless of position.
         let cache = cache();
+        let id_a = image_id_for("data:a");
+        let id_b = image_id_for("data:b");
+        let id_c = image_id_for("data:c");
         let mut req = base_request(vec![
             user_with(vec![input_image("data:a"), input_image("data:b")]),
             ResponseItem::message_text("assistant", "ok"),
@@ -575,7 +597,7 @@ mod tests {
             content
                 .iter()
                 .filter_map(|c| match c {
-                    ContentItem::InputText { text } if text.contains("[Image #") => {
+                    ContentItem::InputText { text } if text.contains("<image id=") => {
                         Some(text.clone())
                     }
                     _ => None,
@@ -584,17 +606,22 @@ mod tests {
         };
         let first = collect_placeholders(&req.input[0]);
         let third = collect_placeholders(&req.input[2]);
-        assert!(first[0].contains("[Image #1]"));
-        assert!(first[1].contains("[Image #2]"));
-        assert!(third[0].contains("[Image #3]"));
+        assert!(first[0].contains(&format!("<image id=\"{id_a}\"/>")));
+        assert!(first[1].contains(&format!("<image id=\"{id_b}\"/>")));
+        assert!(third[0].contains(&format!("<image id=\"{id_c}\"/>")));
         assert_eq!(cache.session_len("sess"), 3);
     }
 
     #[test]
-    fn strip_clears_session_so_multi_turn_numbering_resets() {
-        // Turn 1: two images -> #1, #2. Turn 2 (fresh request, history carries
-        // placeholders, one NEW image) -> cache cleared, new image becomes #1.
+    fn strip_clears_session_so_cache_mirrors_current_request_only() {
+        // Turn 1: two images cached under their content ids. Turn 2 (fresh
+        // request, history carries turn 1's placeholders, one NEW image) ->
+        // cache cleared and repopulated so it holds only the image actually
+        // present in this request.
         let cache = cache();
+        let id_a = image_id_for("data:t1a");
+        let id_b = image_id_for("data:t1b");
+        let id_new = image_id_for("data:t2new");
         let mut turn1 = base_request(vec![user_with(vec![
             input_image("data:t1a"),
             input_image("data:t1b"),
@@ -606,23 +633,105 @@ mod tests {
             // Turn 1 history already stripped to placeholders (text only).
             user_with(vec![
                 ContentItem::InputText {
-                    text: image_placeholder_text(1),
+                    text: image_placeholder_text(&id_a),
                 },
                 ContentItem::InputText {
-                    text: image_placeholder_text(2),
+                    text: image_placeholder_text(&id_b),
                 },
             ]),
             ResponseItem::message_text("assistant", "analyzing"),
             user_with(vec![input_image("data:t2new")]),
         ]);
         cache.strip_and_cache_images(&mut turn2, "sess");
-        // Only the new image remains, renumbered to #1.
+        // Only the new image remains, cached under its own content id.
         assert_eq!(cache.session_len("sess"), 1);
         assert_eq!(
-            cache.get("sess", &ImageCache::image_key("sess", "1")),
+            cache.get("sess", &ImageCache::image_key("sess", &id_new)),
             Some(img("data:t2new"))
         );
-        assert_eq!(cache.get("sess", &ImageCache::image_key("sess", "2")), None);
+        assert_eq!(
+            cache.get("sess", &ImageCache::image_key("sess", &id_a)),
+            None
+        );
+    }
+
+    #[test]
+    fn strip_preserves_client_image_markers_verbatim() {
+        // A client's own [Image #N] markers are inert under content-hash ids: a
+        // numeric id can only MISS the cache (surfaced as a corrective note),
+        // never hit a wrong image, so user text passes through unmodified.
+        let cache = cache();
+        let mut req = base_request(vec![user_with(vec![
+            ContentItem::InputText {
+                text: "[Image #6] [Image #7] whats in these images?".into(),
+            },
+            input_image("data:img1"),
+            input_image("data:img2"),
+        ])]);
+        cache.strip_and_cache_images(&mut req, "sess");
+        let ResponseItem::Message { content, .. } = &req.input[0] else {
+            panic!("expected message");
+        };
+        let ContentItem::InputText { text } = &content[0] else {
+            panic!("expected text");
+        };
+        assert_eq!(text, "[Image #6] [Image #7] whats in these images?");
+    }
+
+    #[test]
+    fn image_ids_are_stable_across_requests_and_dedupe_identical_bytes() {
+        let cache = cache();
+        let id = image_id_for("data:img1");
+        let mut first = base_request(vec![user_with(vec![input_image("data:img1")])]);
+        cache.strip_and_cache_images(&mut first, "sess");
+        let mut second = base_request(vec![user_with(vec![
+            input_image("data:img1"),
+            input_image("data:img1"),
+        ])]);
+        cache.strip_and_cache_images(&mut second, "sess");
+        // Same bytes, same id, one cache entry: the one analysis covers both
+        // occurrences.
+        assert_eq!(cache.session_image_ids("sess"), vec![id.clone()]);
+        assert!(
+            cache
+                .get("sess", &ImageCache::image_key("sess", &id))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn prompts_state_a_single_batched_analyze_call() {
+        // B2 coherence: the placeholder, the system prompt, and the imageId
+        // tool-parameter description must all agree that ALL visible ids go in
+        // ONE analyzeImage call. The placeholder carries the batch phrasing and
+        // no single-id-only phrasing survives.
+        let placeholder = image_placeholder_text("deadbeefdeadbeef");
+        assert!(
+            placeholder
+                .contains("analyzeImage(imageId=[\"a1b2c3d4e5f6a7b8\",\"c9d0e1f2a3b4c5d6\"])"),
+            "placeholder shows a batched multi-id call: {placeholder}"
+        );
+        assert!(
+            !placeholder.contains("analyzeImage(imageId=[\"deadbeefdeadbeef\"])"),
+            "no single-id-only phrasing remains: {placeholder}"
+        );
+        assert!(
+            IMAGE_AGENT_SYSTEM_PROMPT.to_lowercase().contains("batch"),
+            "system prompt states batching"
+        );
+        assert!(
+            IMAGE_AGENT_SYSTEM_PROMPT.contains("IGNORE any other image numbering"),
+            "system prompt tells the model to ignore foreign numbering"
+        );
+        let params = analyze_image_tool_parameters();
+        let desc = params["properties"]["imageId"]["description"]
+            .as_str()
+            .expect("imageId description");
+        let desc_lower = desc.to_lowercase();
+        assert!(
+            desc_lower.contains("batch") && desc_lower.contains("all"),
+            "tool-parameter description mentions batching: {desc}"
+        );
     }
 
     // -----------------------------------------------------------------

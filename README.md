@@ -409,9 +409,9 @@ brave_base_url: "https://api.search.brave.com/res/v1"
 ### Image analysis
 
 Images pass through to a profile's upstream untouched by default. Setting
-`image_analysis` on a profile opts it into stripping images out of the latest
-turn, sending them to another profile for description, and feeding that
-description back into the conversation instead:
+`image_analysis` on a profile opts it into stripping images out of every
+user message, sending them to another profile for description, and feeding
+that description back into the conversation instead:
 
 ```yaml
 model_profiles:
@@ -428,11 +428,11 @@ model_profiles:
 `image_analysis.model` must name another EXACT-key profile (not a glob) that
 itself has no `image_analysis` set - redirect chains are rejected at startup,
 as is a profile redirecting to itself. `residual_images` decides what happens
-to an image the redirect could not strip - a `file_id` image, one outside the
-latest user turn, or an image left over in older history: `placeholder` (the
-default) replaces it with an instructive text note so the model asks for a
-description instead of guessing; `reject` fails the turn before dispatch with
-an HTTP 400 instead of contacting the upstream.
+to an image the redirect could not strip - a `file_id` image, or an image in a
+non-user message: `placeholder` (the default) replaces it with an instructive
+text note so the model asks for a description instead of guessing; `reject`
+fails the turn before dispatch with an HTTP 400 instead of contacting the
+upstream.
 
 ## Migrating
 

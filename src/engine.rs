@@ -1268,7 +1268,7 @@ impl Gateway {
         // resolution + system-prompt prefix but BEFORE replay lookup/lowering so
         // that (a) gating sees the resolved/profiled backend, not the raw request
         // model, and (b) replay hashes and the lowered upstream payload only ever
-        // see `[Image #N]` placeholder TEXT, never image bytes. When gating
+        // see `<image id="..."/>` placeholder TEXT, never image bytes. When gating
         // activates, `strip_and_cache_images` mutates `request` in place
         // (images → placeholders, inject one `analyzeImage` tool + system
         // instruction, dedup) and returns a per-turn session; we then lower with
@@ -3420,17 +3420,24 @@ impl Gateway {
             });
 
         let result_text = if vision_request.images.is_empty() {
-            // No requested id resolved to a cached image. Surface a model-visible
-            // message (not an error) so the model can recover (e.g. re-ask or
-            // answer without the image) instead of hanging the turn.
-            format!(
-                "[Vision analysis unavailable: no cached image found for ids {:?}. The image may have expired or the id is wrong.]",
-                vision_request.image_ids
-            )
+            // No requested id resolved. Surface a model-visible correction (not
+            // an error) so the model can fix its call in one round; miss rounds
+            // still count against the analysis ceiling.
+            if vision_request.image_ids.is_empty() {
+                "[Vision analysis unavailable: analyzeImage was called without any image ids. \
+                 Batch ALL ids from the image markers in the latest message into the imageId \
+                 array and call analyzeImage again.]"
+                    .to_string()
+            } else {
+                crate::vision::vision_unresolved_note(
+                    &vision_request.unresolved_ids,
+                    &self.image_cache.session_image_ids(&session.id),
+                )
+            }
         } else {
             // Bounded + cancellable, mirroring run_web_search: a stalled analyzer
             // backend must not hang the turn, and a client hang-up cancels it.
-            tokio::select! {
+            let analysis = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
                 // D6: a kill during the analyzer call cancels it (499), same as a hang-up.
@@ -3448,6 +3455,19 @@ impl Gateway {
                     Ok(Err(err)) => format!("[Vision analysis failed: {err}]"),
                     Err(_) => "[Vision analysis timed out before returning a result.]".to_string(),
                 },
+            };
+            if vision_request.unresolved_ids.is_empty() {
+                analysis
+            } else {
+                // Partial miss: analyze the resolved images, and append the
+                // correction so the model knows which ids were wrong.
+                format!(
+                    "{analysis}\n\n{}",
+                    crate::vision::vision_unresolved_note(
+                        &vision_request.unresolved_ids,
+                        &self.image_cache.session_image_ids(&session.id),
+                    )
+                )
             }
         };
         self.monitor

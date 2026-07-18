@@ -2,18 +2,20 @@
 //!
 //! Ports claude-relay's in-proxy vision offload to llmconduit's canonical
 //! Responses pipeline. When a request resolves to a profile that configures
-//! `image_analysis`, images in the latest user turn are stripped to `[Image #N]`
-//! placeholders, cached, and an `analyzeImage` server tool is injected. When the
-//! model calls `analyzeImage`, the engine resolves the cached image(s) and
-//! dispatches them to the profile-selected analyzer model through the gateway's
-//! own upstreams, then injects the description back into the chat history as a
-//! tool result - exactly the way Brave `web_search` is run server-side.
+//! `image_analysis`, images in every user message are stripped to
+//! `<image id="..."/>` markers, cached, and an `analyzeImage` server tool is
+//! injected. When the model calls `analyzeImage`, the engine resolves the
+//! cached image(s) and dispatches them to the profile-selected analyzer model
+//! through the gateway's own upstreams, then injects the description back into
+//! the chat history as a tool result - exactly the way Brave `web_search` is
+//! run server-side.
 //!
 //! The cache is intentionally SEPARATE from `ReplayStore` (replay is SHA256 over
 //! `(model, instructions, input)` with no TTL); this is a per-session LRU+TTL
 //! keyed by `(session_id, image_id)` that is cleared and repopulated every time
-//! [`ImageCache::strip_and_cache_images`] runs, so multi-turn placeholder
-//! numbering resets like claude-relay's stateless replay.
+//! [`ImageCache::strip_and_cache_images`] runs, so it always mirrors the images
+//! present in the current request; ids are content-derived and therefore
+//! stable across turns.
 //!
 //! Module layout (grouped by concern):
 //! - [`cache`] - the per-session LRU+TTL [`ImageCache`] storage/eviction plus
@@ -36,6 +38,7 @@ mod strip;
 pub use cache::CachedImage;
 pub use cache::ImageCache;
 pub use cache::VisionRequest;
+pub use cache::vision_unresolved_note;
 pub use strip::ANALYZE_IMAGE_TOOL_DESCRIPTION;
 pub use strip::ANALYZE_IMAGE_TOOL_NAME;
 pub use strip::IMAGE_AGENT_SYSTEM_PROMPT;
@@ -43,6 +46,7 @@ pub use strip::analyze_image_tool_parameters;
 pub use strip::analyze_image_tool_spec;
 pub use strip::degrade_residual_images;
 pub use strip::has_residual_images;
+pub use strip::image_id_for;
 pub use strip::tool_is_analyze_image;
 
 // Re-exported from the sibling redaction module so `crate::vision::redact_*`

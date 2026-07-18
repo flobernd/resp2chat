@@ -11,8 +11,9 @@
 //! Separate from `ReplayStore` by design (see the module-level docs on
 //! [`super`]): replay is SHA256 over `(model, instructions, input)` with no TTL,
 //! whereas this is a per-session LRU+TTL keyed by `(session_id, image_id)` that
-//! the strip seam clears and repopulates on every request so multi-turn
-//! placeholder numbering resets like claude-relay's stateless replay.
+//! the strip seam clears and repopulates on every request so it always mirrors
+//! the images present in the current request; ids are content-derived and
+//! therefore stable across turns.
 
 use crate::config::Config;
 use serde_json::Value;
@@ -40,6 +41,10 @@ pub struct CachedImage {
 struct CacheEntry {
     image: CachedImage,
     stored_at: Instant,
+    /// Monotonic per-session insertion rank. `order` is LRU recency (gets
+    /// reorder it), so the document-order id listing shown to the model is
+    /// tracked separately.
+    sequence: u64,
 }
 
 /// Per-session LRU image cache with TTL, keyed by `(session_id, image_id)`.
@@ -62,6 +67,8 @@ struct SessionCache {
     /// and an explicit recency order without pulling in an LRU crate.
     order: VecDeque<String>,
     entries: HashMap<String, CacheEntry>,
+    /// Next value for [`CacheEntry::sequence`].
+    next_sequence: u64,
 }
 
 impl ImageCache {
@@ -84,8 +91,7 @@ impl ImageCache {
         )
     }
 
-    /// The session-scoped cache key for an image number, matching claude-relay's
-    /// `f"{session_id}_Image#{n}"`.
+    /// The session-scoped cache key for a content-derived image id.
     pub fn image_key(session_id: &str, image_id: &str) -> String {
         format!("{session_id}_Image#{image_id}")
     }
@@ -99,6 +105,8 @@ impl ImageCache {
         let mut sessions = self.sessions.lock().expect("image cache mutex");
         self.cleanup_expired_locked(&mut sessions);
         let cache = sessions.entry(session_id.to_string()).or_default();
+        let sequence = cache.next_sequence;
+        cache.next_sequence += 1;
         if cache
             .entries
             .insert(
@@ -106,6 +114,7 @@ impl ImageCache {
                 CacheEntry {
                     image,
                     stored_at: Instant::now(),
+                    sequence,
                 },
             )
             .is_some()
@@ -161,9 +170,35 @@ impl ImageCache {
         });
     }
 
+    /// The session's cached image ids in document order (the order the strip
+    /// walked and stored them). Backs the model-visible "valid ids" listing in
+    /// the analyzeImage miss note: honors TTL and does NOT touch LRU recency.
+    /// Ordered by insertion rank rather than the LRU deque, because gets
+    /// reorder the deque while the listing must mirror the markers' order in
+    /// the prompt.
+    pub fn session_image_ids(&self, session_id: &str) -> Vec<String> {
+        let mut sessions = self.sessions.lock().expect("image cache mutex");
+        self.cleanup_expired_locked(&mut sessions);
+        let Some(cache) = sessions.get(session_id) else {
+            return Vec::new();
+        };
+        let prefix = format!("{session_id}_Image#");
+        let mut ids: Vec<(u64, String)> = cache
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                let id = key.strip_prefix(&prefix)?;
+                Some((entry.sequence, id.to_string()))
+            })
+            .collect();
+        ids.sort_by_key(|(sequence, _)| *sequence);
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
+
     /// Clear a single session's cache (used before repopulating on each strip).
     ///
-    /// `pub(super)` so the strip seam can reset numbering per request.
+    /// `pub(super)` so the strip seam can keep the cache mirroring exactly the
+    /// images present in the current request.
     pub(super) fn clear_session(&self, session_id: &str) {
         let mut sessions = self.sessions.lock().expect("image cache mutex");
         sessions.remove(session_id);
@@ -190,13 +225,19 @@ pub struct VisionRequest {
     pub task: String,
     pub context: Option<String>,
     pub images: Vec<CachedImage>,
+    /// Requested ids that did not exactly match a cached image. Resolution is
+    /// exact-only so a wrong id can never silently land on the wrong image;
+    /// these are surfaced to the model via [`vision_unresolved_note`] so it can
+    /// correct its call in one round.
+    pub unresolved_ids: Vec<String>,
 }
 
 impl VisionRequest {
     /// Parse the `analyzeImage` tool arguments into a structured request,
     /// resolving each requested image id against the cache for `session_id`.
-    /// Missing ids are simply skipped (claude-relay logs + skips); the executor
-    /// decides what model-visible text to inject.
+    /// Resolution is exact-only: ids that miss go to `unresolved_ids` for the
+    /// executor to surface as a corrective note, and a wholly unresolvable
+    /// request leaves `images` empty.
     pub fn from_arguments(arguments: &Value, session_id: &str, cache: &ImageCache) -> Self {
         let image_ids = arguments
             .get("imageId")
@@ -214,17 +255,58 @@ impl VisionRequest {
             .and_then(Value::as_str)
             .filter(|context| !context.trim().is_empty())
             .map(ToString::to_string);
-        let images = image_ids
-            .iter()
-            .filter_map(|id| cache.get(session_id, &ImageCache::image_key(session_id, id)))
-            .collect();
+        let mut images = Vec::new();
+        let mut unresolved_ids = Vec::new();
+        for id in &image_ids {
+            match cache.get(session_id, &ImageCache::image_key(session_id, id)) {
+                Some(image) => images.push(image),
+                // Dedupe: this list renders verbatim in the model-visible
+                // correction note, so a repeated wrong id must not repeat there.
+                None if !unresolved_ids.contains(id) => unresolved_ids.push(id.clone()),
+                None => {}
+            }
+        }
         Self {
             image_ids,
             task,
             context,
             images,
+            unresolved_ids,
         }
     }
+}
+
+/// Model-visible note for `analyzeImage` ids that resolved to nothing. Lists
+/// the session's valid ids (document order) so the model can correct its call
+/// in ONE follow-up round; ids are content hashes, so a wrong id can only ever
+/// miss and this note is the whole recovery path. A correctly copied id can
+/// also miss when its entry was LRU-evicted or TTL-expired, so the note hedges
+/// rather than blaming the id outright. Miss rounds still count against the
+/// analysis round ceiling (a free retry could loop unboundedly).
+pub fn vision_unresolved_note(unresolved_ids: &[String], valid_ids: &[String]) -> String {
+    let unresolved = quote_join(unresolved_ids);
+    if valid_ids.is_empty() {
+        format!(
+            "[Vision analysis unavailable: no image found for id(s) {unresolved}, and no images \
+             are currently cached for this session. The images may have expired; ask the user to \
+             attach them again.]"
+        )
+    } else {
+        let valid = quote_join(valid_ids);
+        format!(
+            "[Vision analysis unavailable: no image found for id(s) {unresolved}. Valid image ids \
+             in this conversation: {valid}. Copy ids EXACTLY from the image markers and call \
+             analyzeImage again. If an id you copied exactly is not listed, that image is no \
+             longer cached (evicted or expired); ask the user to attach it again.]"
+        )
+    }
+}
+
+fn quote_join(ids: &[String]) -> String {
+    ids.iter()
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Coerce a JSON `imageId` array element to a string id. Accepts string or
@@ -370,22 +452,34 @@ mod tests {
     #[test]
     fn vision_request_parses_arguments_and_resolves_images() {
         let cache = cache();
-        cache.store("sess", ImageCache::image_key("sess", "1"), img("data:one"));
-        cache.store("sess", ImageCache::image_key("sess", "2"), img("data:two"));
+        cache.store(
+            "sess",
+            ImageCache::image_key("sess", "1111aaaa2222bbbb"),
+            img("data:one"),
+        );
+        cache.store(
+            "sess",
+            ImageCache::image_key("sess", "3333cccc4444dddd"),
+            img("data:two"),
+        );
         let args = serde_json::json!({
-            "imageId": ["1", "2", "9"],
+            "imageId": ["1111aaaa2222bbbb", "3333cccc4444dddd", "9"],
             "task": "read the sign",
             "context": "user asked about the sign"
         });
         let request = VisionRequest::from_arguments(&args, "sess", &cache);
-        assert_eq!(request.image_ids, vec!["1", "2", "9"]);
+        assert_eq!(
+            request.image_ids,
+            vec!["1111aaaa2222bbbb", "3333cccc4444dddd", "9"]
+        );
         assert_eq!(request.task, "read the sign");
         assert_eq!(
             request.context.as_deref(),
             Some("user asked about the sign")
         );
-        // #9 missing from cache, so only two images resolve.
+        // "9" is not cached: reported as unresolved, never remapped.
         assert_eq!(request.images, vec![img("data:one"), img("data:two")]);
+        assert_eq!(request.unresolved_ids, vec!["9"]);
     }
 
     #[test]
@@ -396,5 +490,78 @@ mod tests {
         assert_eq!(request.image_ids, vec!["1"]);
         assert_eq!(request.task, "Describe this image in detail");
         assert_eq!(request.context, None);
+    }
+
+    #[test]
+    fn vision_request_reports_unresolved_ids_without_guessing() {
+        let cache = cache();
+        cache.store(
+            "sess",
+            ImageCache::image_key("sess", "aaaa1111aaaa1111"),
+            img("data:one"),
+        );
+        cache.store(
+            "sess",
+            ImageCache::image_key("sess", "bbbb2222bbbb2222"),
+            img("data:two"),
+        );
+        // A foreign numeric id (e.g. a client's own [Image #6] numbering) must
+        // surface as unresolved, never silently resolve to some cached image.
+        let args = serde_json::json!({ "imageId": ["6", "bbbb2222bbbb2222"], "task": "t" });
+        let request = VisionRequest::from_arguments(&args, "sess", &cache);
+        assert_eq!(request.unresolved_ids, vec!["6"]);
+        assert_eq!(request.images, vec![img("data:two")]);
+    }
+
+    #[test]
+    fn vision_request_dedupes_repeated_unresolved_ids() {
+        let cache = cache();
+        // A duplicated wrong id must appear once in unresolved_ids: it renders
+        // verbatim in the model-visible note, so a repeat there would just be
+        // noise ("6", "6" instead of "6").
+        let args = serde_json::json!({ "imageId": ["6", "6"], "task": "t" });
+        let request = VisionRequest::from_arguments(&args, "sess", &cache);
+        assert_eq!(request.unresolved_ids, vec!["6"]);
+        assert!(request.images.is_empty());
+    }
+
+    #[test]
+    fn session_image_ids_lists_document_order_despite_lru_touches() {
+        let cache = cache();
+        cache.store(
+            "sess",
+            ImageCache::image_key("sess", "aaaa1111aaaa1111"),
+            img("data:one"),
+        );
+        cache.store(
+            "sess",
+            ImageCache::image_key("sess", "bbbb2222bbbb2222"),
+            img("data:two"),
+        );
+        // An LRU touch must not reorder the model-visible id listing: it has to
+        // mirror the order the markers appear in the prompt.
+        let _ = cache.get("sess", &ImageCache::image_key("sess", "aaaa1111aaaa1111"));
+        assert_eq!(
+            cache.session_image_ids("sess"),
+            vec!["aaaa1111aaaa1111", "bbbb2222bbbb2222"]
+        );
+    }
+
+    #[test]
+    fn vision_unresolved_note_lists_valid_ids() {
+        let note = vision_unresolved_note(
+            &["6".to_string()],
+            &[
+                "aaaa1111aaaa1111".to_string(),
+                "bbbb2222bbbb2222".to_string(),
+            ],
+        );
+        assert!(note.contains("no image found for id(s) \"6\""));
+        assert!(note.contains("\"aaaa1111aaaa1111\", \"bbbb2222bbbb2222\""));
+        // The id may have been copied correctly yet evicted/expired; the note
+        // must not insist the model mistyped it.
+        assert!(note.contains("no longer cached (evicted or expired)"));
+        let empty = vision_unresolved_note(&["6".to_string()], &[]);
+        assert!(empty.contains("no images are currently cached"));
     }
 }
