@@ -149,6 +149,29 @@ fn build_configured_persisted_config(
     }
 }
 
+/// The upstream the wizard pre-fills from: the entry named `default`, else
+/// the first one. Matches the name trimmed and ASCII-case-insensitively so it
+/// finds the same entry the runtime upstream lookup would.
+fn existing_default_upstream(existing: &PersistedConfig) -> Option<&PersistedUpstream> {
+    existing
+        .upstreams
+        .iter()
+        .find(|entry| entry.name.trim().eq_ignore_ascii_case("default"))
+        .or_else(|| existing.upstreams.first())
+}
+
+/// The `"*"` catch-all profile's upstream model, for pre-filling the default
+/// model prompt. Keys are trimmed to match parse-time normalization, but not
+/// case folded since `"*"` is a symbol.
+fn existing_catch_all_model(existing: &PersistedConfig) -> Option<String> {
+    existing
+        .model_profiles
+        .0
+        .iter()
+        .find(|(name, _)| name.trim() == "*")
+        .and_then(|(_, profile)| profile.upstream_model.clone())
+}
+
 pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
     let existing = load_persisted_config(&path)?;
     let theme = ColorfulTheme::default();
@@ -165,11 +188,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
     // The single default endpoint is persisted as one `upstreams` entry named
     // "default" plus a `"*"` catch-all profile pointing at it, so the interactive
     // prompts pre-fill from (and write back) that shape.
-    let existing_default = existing
-        .upstreams
-        .iter()
-        .find(|entry| entry.name == "default")
-        .or_else(|| existing.upstreams.first());
+    let existing_default = existing_default_upstream(&existing);
     let existing_url = existing_default
         .map(|entry| entry.url.clone())
         .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string());
@@ -180,12 +199,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
     let existing_request_log_path = existing_default
         .and_then(|entry| entry.request_log_path.clone())
         .or_else(|| existing.upstream_request_log_path.clone());
-    let existing_default_model = existing
-        .model_profiles
-        .0
-        .iter()
-        .find(|(name, _)| name == "*")
-        .and_then(|(_, profile)| profile.upstream_model.clone());
+    let existing_default_model = existing_catch_all_model(&existing);
 
     let upstream_base_url = Input::with_theme(&theme)
         .with_prompt("Upstream chat-completions base URL")
@@ -344,5 +358,69 @@ mod tests {
         let route = config.resolve_route("anything").expect("route resolves");
         assert_eq!(route.profile.upstream, "default");
         assert_eq!(route.served_model, "my-model");
+    }
+
+    fn upstream_named(name: &str, url: &str) -> PersistedUpstream {
+        PersistedUpstream {
+            name: name.to_string(),
+            url: url.to_string(),
+            api_key: None,
+            chat_kwargs: JsonMap::new(),
+            request_log_path: None,
+            upstream_model: None,
+            fallback_upstreams: None,
+        }
+    }
+
+    /// Runtime upstream resolution matches names trimmed and
+    /// ASCII-case-insensitively, so `name: Default` is a valid default entry;
+    /// the wizard must pre-fill from it, not from an unrelated first entry.
+    #[test]
+    fn default_upstream_lookup_ignores_case_and_surrounding_whitespace() {
+        let existing = PersistedConfig {
+            upstreams: vec![
+                upstream_named("other", "http://other.example/v1"),
+                upstream_named(" Default ", "http://default.example/v1"),
+            ],
+            ..PersistedConfig::default()
+        };
+
+        let entry = existing_default_upstream(&existing).expect("default entry found");
+        assert_eq!(entry.url, "http://default.example/v1");
+    }
+
+    /// Without an entry named `default` the wizard still pre-fills from the
+    /// first upstream rather than presenting empty prompts.
+    #[test]
+    fn default_upstream_lookup_falls_back_to_first_entry() {
+        let existing = PersistedConfig {
+            upstreams: vec![upstream_named("primary", "http://primary.example/v1")],
+            ..PersistedConfig::default()
+        };
+
+        let entry = existing_default_upstream(&existing).expect("fallback entry found");
+        assert_eq!(entry.url, "http://primary.example/v1");
+    }
+
+    /// Profile keys are trimmed at parse time, so a `" * "` key is the
+    /// catch-all at runtime; the wizard must pre-fill its upstream model.
+    #[test]
+    fn catch_all_model_lookup_trims_profile_key() {
+        let existing = PersistedConfig {
+            model_profiles: OrderedModelProfiles(vec![(
+                " * ".to_string(),
+                PersistedModelProfile {
+                    upstream: Some("default".to_string()),
+                    upstream_model: Some("my-model".to_string()),
+                    ..PersistedModelProfile::default()
+                },
+            )]),
+            ..PersistedConfig::default()
+        };
+
+        assert_eq!(
+            existing_catch_all_model(&existing),
+            Some("my-model".to_string())
+        );
     }
 }
